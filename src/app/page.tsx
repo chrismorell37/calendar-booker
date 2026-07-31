@@ -1,11 +1,10 @@
 import Link from "next/link";
-import { getHostSettings } from "@/lib/db";
-
-export const dynamic = "force-dynamic";
+import { DEFAULT_SETTINGS } from "@/lib/types";
 
 export default function HomePage() {
-  const settings = getHostSettings();
-  const name = settings.hostName || "Chris";
+  // Keep the landing page free of SQLite so it always loads on Vercel.
+  const name = DEFAULT_SETTINGS.hostName || "Chris";
+  const slug = DEFAULT_SETTINGS.slug;
 
   return (
     <div className="page-shell">
@@ -26,7 +25,7 @@ export default function HomePage() {
 
         <div className="animate-rise-delay-1 mt-10 flex flex-wrap items-center gap-3">
           <Link
-            href={`/book/${settings.slug}`}
+            href={`/book/${slug}`}
             className="rounded-md bg-accent px-5 py-3 text-sm font-semibold text-white shadow-[0_10px_28px_-14px_rgba(26,107,85,0.7)] transition hover:bg-accent-hover hover:shadow-[0_12px_30px_-12px_rgba(26,107,85,0.75)]"
           >
             Book a meeting

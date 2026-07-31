@@ -10,8 +10,15 @@ import {
   type WeeklyHours,
 } from "./types";
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const DB_PATH = path.join(DATA_DIR, "booking.db");
+const DATA_DIR =
+  process.env.VERCEL || process.env.SQLITE_PATH
+    ? path.dirname(process.env.SQLITE_PATH || "/tmp/calendar-booking/booking.db")
+    : path.join(process.cwd(), "data");
+const DB_PATH =
+  process.env.SQLITE_PATH ||
+  (process.env.VERCEL
+    ? "/tmp/calendar-booking/booking.db"
+    : path.join(DATA_DIR, "booking.db"));
 
 let dbInstance: Database.Database | null = null;
 
@@ -21,7 +28,8 @@ function getDb(): Database.Database {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
   const db = new Database(DB_PATH);
-  db.pragma("journal_mode = WAL");
+  // WAL can be flaky on ephemeral /tmp filesystems (Vercel)
+  db.pragma(process.env.VERCEL ? "journal_mode = DELETE" : "journal_mode = WAL");
   db.exec(`
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
