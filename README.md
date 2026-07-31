@@ -21,6 +21,7 @@ Fill in `.env`:
 | `SESSION_SECRET` | 32+ chars; admin cookie |
 | `ADMIN_PASSWORD` | Password for `/admin` |
 | `NEXT_PUBLIC_APP_URL` | Public base URL |
+| `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN` | **Required on Vercel** — persistent DB for OAuth tokens & settings |
 
 2. **Google Cloud**
 
@@ -30,7 +31,23 @@ Fill in `.env`:
 - Add authorized redirect URI matching `GOOGLE_REDIRECT_URI`
 - Add your Google account as a test user if the app is in testing mode
 
-3. **Run**
+3. **Database (local vs Vercel)**
+
+- **Local:** omit Turso vars; data is stored in `data/booking.db`
+- **Vercel / serverless:** you **must** use [Turso](https://turso.tech) (or any libSQL URL). SQLite on `/tmp` is wiped when instances recycle, which makes Google calendars look disconnected every few minutes.
+
+```bash
+# Example Turso setup
+brew install tursodatabase/tap/turso   # or see turso.tech docs
+turso auth login
+turso db create calendar-booker
+turso db show calendar-booker --url          # → TURSO_DATABASE_URL
+turso db tokens create calendar-booker       # → TURSO_AUTH_TOKEN
+```
+
+Add both values in the Vercel project env settings, then redeploy.
+
+4. **Run**
 
 ```bash
 npm run dev
@@ -51,4 +68,4 @@ Availability uses Google Calendar `freebusy` on every conflict calendar (queried
 
 Add each Google account you connect as a **test user** on the OAuth consent screen while the app is in testing mode.
 
-SQLite data lives in `data/booking.db` (created automatically).
+After deploying with Turso, reconnect Google once in `/admin` — previous tokens stored in ephemeral `/tmp` SQLite will not migrate.

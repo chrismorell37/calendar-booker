@@ -11,7 +11,7 @@ type Props = {
 
 export default async function BookPage({ params }: Props) {
   const { slug } = await params;
-  const settings = findHostBySlug(slug);
+  const settings = await findHostBySlug(slug);
   if (!settings) notFound();
 
   const dates = listBookableDates(settings, 60);

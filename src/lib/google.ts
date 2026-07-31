@@ -56,7 +56,7 @@ export async function exchangeCodeForTokens(code: string) {
   if (!email) {
     throw new Error("Google did not return an email for this account");
   }
-  const accountId = saveOAuthAccount({
+  const accountId = await saveOAuthAccount({
     accessTokenEncrypted: tokens.access_token ? encrypt(tokens.access_token) : null,
     refreshTokenEncrypted: encrypt(tokens.refresh_token),
     expiryDate: tokens.expiry_date ?? null,
@@ -67,7 +67,7 @@ export async function exchangeCodeForTokens(code: string) {
 }
 
 async function getAuthedClient(accountId: number) {
-  const stored = getAccountById(accountId);
+  const stored = await getAccountById(accountId);
   if (!stored) {
     throw new Error("Google account not connected");
   }
@@ -81,17 +81,19 @@ async function getAuthedClient(accountId: number) {
   });
 
   client.on("tokens", (tokens) => {
-    const current = getAccountById(accountId);
-    if (!current) return;
-    updateAccountTokens(accountId, {
-      accessTokenEncrypted: tokens.access_token
-        ? encrypt(tokens.access_token)
-        : current.accessTokenEncrypted,
-      refreshTokenEncrypted: tokens.refresh_token
-        ? encrypt(tokens.refresh_token)
-        : undefined,
-      expiryDate: tokens.expiry_date ?? current.expiryDate,
-    });
+    void (async () => {
+      const current = await getAccountById(accountId);
+      if (!current) return;
+      await updateAccountTokens(accountId, {
+        accessTokenEncrypted: tokens.access_token
+          ? encrypt(tokens.access_token)
+          : current.accessTokenEncrypted,
+        refreshTokenEncrypted: tokens.refresh_token
+          ? encrypt(tokens.refresh_token)
+          : undefined,
+        expiryDate: tokens.expiry_date ?? current.expiryDate,
+      });
+    })();
   });
 
   return client;
@@ -107,13 +109,13 @@ export async function refreshCalendarListForAccount(accountId: number) {
       googleCalendarId: c.id!,
       summary: c.summary!,
     }));
-  upsertCalendarsForAccount(accountId, items);
+  await upsertCalendarsForAccount(accountId, items);
 
-  const prefs = listCalendars();
+  const prefs = await listCalendars();
   if (!prefs.some((p) => p.isDestination) && items.length > 0) {
     const primary =
       (res.data.items ?? []).find((c) => c.primary)?.id ?? items[0].googleCalendarId;
-    updateCalendarPrefs(
+    await updateCalendarPrefs(
       prefs.map((p) => ({
         googleCalendarId: p.googleCalendarId,
         checkConflicts: true,
@@ -126,7 +128,7 @@ export async function refreshCalendarListForAccount(accountId: number) {
 }
 
 export async function refreshCalendarList() {
-  const accounts = listConnectedAccounts();
+  const accounts = await listConnectedAccounts();
   if (accounts.length === 0) {
     throw new Error("No Google accounts connected");
   }
@@ -142,7 +144,7 @@ export async function queryFreeBusy(
   timeMin: Date,
   timeMax: Date,
 ): Promise<BusyPeriod[]> {
-  const conflictCals = getConflictCalendars();
+  const conflictCals = await getConflictCalendars();
   if (conflictCals.length === 0) return [];
 
   const byAccount = new Map<number, string[]>();
@@ -186,14 +188,15 @@ export async function createCalendarEvent(input: {
   attendeeName: string;
   additionalGuestEmails?: string[];
 }) {
-  const destination = getDestinationCalendar();
+  const destination = await getDestinationCalendar();
   if (!destination || destination.googleCalendarId !== input.calendarId) {
     // Still allow explicit calendarId if it matches a known calendar
   }
   const accountId =
     destination?.googleCalendarId === input.calendarId
       ? destination.accountId
-      : listCalendars().find((c) => c.googleCalendarId === input.calendarId)?.accountId;
+      : (await listCalendars()).find((c) => c.googleCalendarId === input.calendarId)
+          ?.accountId;
 
   if (!accountId) {
     throw new Error("Destination calendar is not linked to a Google account");
@@ -240,10 +243,10 @@ export async function createCalendarEvent(input: {
   return res.data;
 }
 
-export function isGoogleConnected(): boolean {
+export async function isGoogleConnected(): Promise<boolean> {
   return hasAnyGoogleAccount();
 }
 
-export function getConnectedEmails(): string[] {
-  return listConnectedAccounts().map((a) => a.email);
+export async function getConnectedEmails(): Promise<string[]> {
+  return (await listConnectedAccounts()).map((a) => a.email);
 }

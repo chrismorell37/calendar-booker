@@ -1,4 +1,4 @@
-import Database from "better-sqlite3";
+import { createClient, type Client, type InArgs, type ResultSet } from "@libsql/client";
 import fs from "fs";
 import path from "path";
 import {
@@ -10,264 +10,341 @@ import {
   type WeeklyHours,
 } from "./types";
 
-const DATA_DIR =
-  process.env.VERCEL || process.env.SQLITE_PATH
-    ? path.dirname(process.env.SQLITE_PATH || "/tmp/calendar-booking/booking.db")
-    : path.join(process.cwd(), "data");
-const DB_PATH =
-  process.env.SQLITE_PATH ||
-  (process.env.VERCEL
-    ? "/tmp/calendar-booking/booking.db"
-    : path.join(DATA_DIR, "booking.db"));
+let clientInstance: Client | null = null;
+let initPromise: Promise<void> | null = null;
 
-let dbInstance: Database.Database | null = null;
+function createDbClient(): Client {
+  const tursoUrl = process.env.TURSO_DATABASE_URL;
+  const tursoToken = process.env.TURSO_AUTH_TOKEN;
 
-function getDb(): Database.Database {
-  if (dbInstance) return dbInstance;
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (tursoUrl) {
+    return createClient({
+      url: tursoUrl,
+      authToken: tursoToken,
+    });
   }
-  const db = new Database(DB_PATH);
-  // WAL can be flaky on ephemeral /tmp filesystems (Vercel)
-  db.pragma(process.env.VERCEL ? "journal_mode = DELETE" : "journal_mode = WAL");
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS settings (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
 
-    CREATE TABLE IF NOT EXISTS oauth_accounts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT NOT NULL UNIQUE,
-      access_token_encrypted TEXT,
-      refresh_token_encrypted TEXT NOT NULL,
-      expiry_date INTEGER,
-      updated_at TEXT NOT NULL
+  // Vercel /tmp is ephemeral: each serverless instance gets its own empty DB,
+  // so OAuth tokens and calendar prefs appear to "disconnect" within minutes.
+  if (process.env.VERCEL) {
+    throw new Error(
+      "Persistent storage required on Vercel. Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN (see README).",
     );
+  }
 
-    CREATE TABLE IF NOT EXISTS calendars (
-      google_calendar_id TEXT PRIMARY KEY,
-      summary TEXT NOT NULL,
-      account_id INTEGER NOT NULL,
-      check_conflicts INTEGER NOT NULL DEFAULT 1,
-      is_destination INTEGER NOT NULL DEFAULT 0,
-      updated_at TEXT NOT NULL,
-      FOREIGN KEY (account_id) REFERENCES oauth_accounts(id) ON DELETE CASCADE
-    );
-  `);
-  migrateLegacy(db);
-  seedDefaults(db);
-  dbInstance = db;
-  return db;
+  const dataDir = path.join(process.cwd(), "data");
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+  const dbPath = process.env.SQLITE_PATH || path.join(dataDir, "booking.db");
+  return createClient({ url: `file:${dbPath}` });
 }
 
-/** Migrate old single-row oauth_tokens / calendars schema if present. */
-function migrateLegacy(db: Database.Database) {
-  // Ensure calendars.account_id exists on older DBs
-  const calCols = db.prepare(`PRAGMA table_info(calendars)`).all() as Array<{
-    name: string;
-  }>;
-  if (calCols.length > 0 && !calCols.some((c) => c.name === "account_id")) {
-    db.exec(`ALTER TABLE calendars ADD COLUMN account_id INTEGER`);
+async function migrateLegacy(client: Client) {
+  const calCols = await client.execute(`PRAGMA table_info(calendars)`);
+  const hasAccountId = calCols.rows.some((c) => c.name === "account_id");
+  if (calCols.rows.length > 0 && !hasAccountId) {
+    await client.execute(`ALTER TABLE calendars ADD COLUMN account_id INTEGER`);
   }
 
-  const tables = db
-    .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='oauth_tokens'`)
-    .get() as { name: string } | undefined;
-  if (!tables) return;
+  const tables = await client.execute(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name='oauth_tokens'`,
+  );
+  if (tables.rows.length === 0) return;
 
-  const legacy = db
-    .prepare(
-      `SELECT access_token_encrypted, refresh_token_encrypted, expiry_date, email, updated_at
-       FROM oauth_tokens WHERE id = 1`,
-    )
-    .get() as
-    | {
-        access_token_encrypted: string | null;
-        refresh_token_encrypted: string;
-        expiry_date: number | null;
-        email: string | null;
-        updated_at: string;
-      }
-    | undefined;
+  const legacyRes = await client.execute(
+    `SELECT access_token_encrypted, refresh_token_encrypted, expiry_date, email, updated_at
+     FROM oauth_tokens WHERE id = 1`,
+  );
+  const legacyRow = legacyRes.rows[0];
+  if (!legacyRow) {
+    await client.execute("DROP TABLE IF EXISTS oauth_tokens");
+    return;
+  }
 
-  if (legacy?.email && legacy.refresh_token_encrypted) {
-    const existing = db
-      .prepare("SELECT id FROM oauth_accounts WHERE email = ?")
-      .get(legacy.email) as { id: number } | undefined;
-    let accountId = existing?.id;
+  const legacyEmail =
+    legacyRow.email == null ? null : String(legacyRow.email);
+  const legacyRefresh =
+    legacyRow.refresh_token_encrypted == null
+      ? null
+      : String(legacyRow.refresh_token_encrypted);
+
+  if (legacyEmail && legacyRefresh) {
+    const existing = await client.execute({
+      sql: "SELECT id FROM oauth_accounts WHERE email = ?",
+      args: [legacyEmail],
+    });
+    let accountId = existing.rows[0]?.id as number | undefined;
     if (!accountId) {
-      const info = db
-        .prepare(
-          `INSERT INTO oauth_accounts (email, access_token_encrypted, refresh_token_encrypted, expiry_date, updated_at)
-           VALUES (?, ?, ?, ?, ?)`,
-        )
-        .run(
-          legacy.email,
-          legacy.access_token_encrypted,
-          legacy.refresh_token_encrypted,
-          legacy.expiry_date,
-          legacy.updated_at,
-        );
+      const info = await client.execute({
+        sql: `INSERT INTO oauth_accounts (email, access_token_encrypted, refresh_token_encrypted, expiry_date, updated_at)
+              VALUES (?, ?, ?, ?, ?)`,
+        args: [
+          legacyEmail,
+          legacyRow.access_token_encrypted == null
+            ? null
+            : String(legacyRow.access_token_encrypted),
+          legacyRefresh,
+          legacyRow.expiry_date == null ? null : Number(legacyRow.expiry_date),
+          String(legacyRow.updated_at ?? new Date().toISOString()),
+        ],
+      });
       accountId = Number(info.lastInsertRowid);
     }
-    db.prepare(
-      `UPDATE calendars SET account_id = ? WHERE account_id IS NULL OR account_id = 0`,
-    ).run(accountId);
+    await client.execute({
+      sql: `UPDATE calendars SET account_id = ? WHERE account_id IS NULL OR account_id = 0`,
+      args: [accountId],
+    });
   }
 
-  db.exec("DROP TABLE IF EXISTS oauth_tokens");
+  await client.execute("DROP TABLE IF EXISTS oauth_tokens");
 }
 
-function seedDefaults(db: Database.Database) {
-  const count = db.prepare("SELECT COUNT(*) AS c FROM settings").get() as { c: number };
-  if (count.c > 0) return;
-  const insert = db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)");
-  const seed = db.transaction(() => {
-    insert.run("slug", DEFAULT_SETTINGS.slug);
-    insert.run("hostName", DEFAULT_SETTINGS.hostName);
-    insert.run("timezone", DEFAULT_SETTINGS.timezone);
-    insert.run("bufferMinutes", String(DEFAULT_SETTINGS.bufferMinutes));
-    insert.run("slotIntervalMinutes", String(DEFAULT_SETTINGS.slotIntervalMinutes));
-    insert.run("durations", JSON.stringify(DEFAULT_SETTINGS.durations));
-    insert.run("weeklyHours", JSON.stringify(DEFAULT_SETTINGS.weeklyHours));
-    insert.run("meetingTitle", DEFAULT_SETTINGS.meetingTitle);
-  });
-  seed();
+async function seedDefaults(client: Client) {
+  const countRes = await client.execute("SELECT COUNT(*) AS c FROM settings");
+  const count = Number(countRes.rows[0]?.c ?? 0);
+  if (count > 0) return;
+
+  await client.batch(
+    [
+      {
+        sql: "INSERT INTO settings (key, value) VALUES (?, ?)",
+        args: ["slug", DEFAULT_SETTINGS.slug],
+      },
+      {
+        sql: "INSERT INTO settings (key, value) VALUES (?, ?)",
+        args: ["hostName", DEFAULT_SETTINGS.hostName],
+      },
+      {
+        sql: "INSERT INTO settings (key, value) VALUES (?, ?)",
+        args: ["timezone", DEFAULT_SETTINGS.timezone],
+      },
+      {
+        sql: "INSERT INTO settings (key, value) VALUES (?, ?)",
+        args: ["bufferMinutes", String(DEFAULT_SETTINGS.bufferMinutes)],
+      },
+      {
+        sql: "INSERT INTO settings (key, value) VALUES (?, ?)",
+        args: ["slotIntervalMinutes", String(DEFAULT_SETTINGS.slotIntervalMinutes)],
+      },
+      {
+        sql: "INSERT INTO settings (key, value) VALUES (?, ?)",
+        args: ["durations", JSON.stringify(DEFAULT_SETTINGS.durations)],
+      },
+      {
+        sql: "INSERT INTO settings (key, value) VALUES (?, ?)",
+        args: ["weeklyHours", JSON.stringify(DEFAULT_SETTINGS.weeklyHours)],
+      },
+      {
+        sql: "INSERT INTO settings (key, value) VALUES (?, ?)",
+        args: ["meetingTitle", DEFAULT_SETTINGS.meetingTitle],
+      },
+    ],
+    "write",
+  );
 }
 
-function getSetting(key: string): string | null {
-  const row = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(key) as
-    | { value: string }
-    | undefined;
-  return row?.value ?? null;
+async function ensureDb(): Promise<Client> {
+  if (clientInstance && initPromise) {
+    await initPromise;
+    return clientInstance;
+  }
+  clientInstance = createDbClient();
+  initPromise = (async () => {
+    const client = clientInstance!;
+    await client.executeMultiple(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS oauth_accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL UNIQUE,
+        access_token_encrypted TEXT,
+        refresh_token_encrypted TEXT NOT NULL,
+        expiry_date INTEGER,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS calendars (
+        google_calendar_id TEXT PRIMARY KEY,
+        summary TEXT NOT NULL,
+        account_id INTEGER NOT NULL,
+        check_conflicts INTEGER NOT NULL DEFAULT 1,
+        is_destination INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (account_id) REFERENCES oauth_accounts(id) ON DELETE CASCADE
+      );
+    `);
+    await migrateLegacy(client);
+    await seedDefaults(client);
+  })();
+  await initPromise;
+  return clientInstance;
 }
 
-function setSetting(key: string, value: string) {
-  getDb()
-    .prepare(
-      `INSERT INTO settings (key, value) VALUES (?, ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-    )
-    .run(key, value);
+async function getDb(): Promise<Client> {
+  return ensureDb();
 }
 
-export function getHostSettings(): HostSettings {
+async function execute(sql: string, args: InArgs = []): Promise<ResultSet> {
+  const db = await getDb();
+  return db.execute({ sql, args });
+}
+
+async function getSetting(key: string): Promise<string | null> {
+  const row = await execute("SELECT value FROM settings WHERE key = ?", [key]);
+  const value = row.rows[0]?.value;
+  return typeof value === "string" ? value : null;
+}
+
+async function setSetting(key: string, value: string) {
+  await execute(
+    `INSERT INTO settings (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    [key, value],
+  );
+}
+
+export async function getHostSettings(): Promise<HostSettings> {
   return {
-    slug: getSetting("slug") ?? DEFAULT_SETTINGS.slug,
-    hostName: getSetting("hostName") ?? DEFAULT_SETTINGS.hostName,
-    timezone: getSetting("timezone") ?? DEFAULT_SETTINGS.timezone,
-    bufferMinutes: Number(getSetting("bufferMinutes") ?? DEFAULT_SETTINGS.bufferMinutes),
+    slug: (await getSetting("slug")) ?? DEFAULT_SETTINGS.slug,
+    hostName: (await getSetting("hostName")) ?? DEFAULT_SETTINGS.hostName,
+    timezone: (await getSetting("timezone")) ?? DEFAULT_SETTINGS.timezone,
+    bufferMinutes: Number(
+      (await getSetting("bufferMinutes")) ?? DEFAULT_SETTINGS.bufferMinutes,
+    ),
     slotIntervalMinutes: Number(
-      getSetting("slotIntervalMinutes") ?? DEFAULT_SETTINGS.slotIntervalMinutes,
+      (await getSetting("slotIntervalMinutes")) ?? DEFAULT_SETTINGS.slotIntervalMinutes,
     ),
     durations: JSON.parse(
-      getSetting("durations") ?? JSON.stringify(DEFAULT_SETTINGS.durations),
+      (await getSetting("durations")) ?? JSON.stringify(DEFAULT_SETTINGS.durations),
     ) as number[],
     weeklyHours: JSON.parse(
-      getSetting("weeklyHours") ?? JSON.stringify(DEFAULT_SETTINGS.weeklyHours),
+      (await getSetting("weeklyHours")) ?? JSON.stringify(DEFAULT_SETTINGS.weeklyHours),
     ) as WeeklyHours,
-    meetingTitle: getSetting("meetingTitle") ?? DEFAULT_SETTINGS.meetingTitle,
+    meetingTitle: (await getSetting("meetingTitle")) ?? DEFAULT_SETTINGS.meetingTitle,
   };
 }
 
-export function updateHostSettings(partial: Partial<HostSettings>) {
-  if (partial.slug !== undefined) setSetting("slug", partial.slug);
-  if (partial.hostName !== undefined) setSetting("hostName", partial.hostName);
-  if (partial.timezone !== undefined) setSetting("timezone", partial.timezone);
+export async function updateHostSettings(partial: Partial<HostSettings>) {
+  if (partial.slug !== undefined) await setSetting("slug", partial.slug);
+  if (partial.hostName !== undefined) await setSetting("hostName", partial.hostName);
+  if (partial.timezone !== undefined) await setSetting("timezone", partial.timezone);
   if (partial.bufferMinutes !== undefined) {
-    setSetting("bufferMinutes", String(partial.bufferMinutes));
+    await setSetting("bufferMinutes", String(partial.bufferMinutes));
   }
   if (partial.slotIntervalMinutes !== undefined) {
-    setSetting("slotIntervalMinutes", String(partial.slotIntervalMinutes));
+    await setSetting("slotIntervalMinutes", String(partial.slotIntervalMinutes));
   }
   if (partial.durations !== undefined) {
-    setSetting("durations", JSON.stringify(partial.durations));
+    await setSetting("durations", JSON.stringify(partial.durations));
   }
   if (partial.weeklyHours !== undefined) {
-    setSetting("weeklyHours", JSON.stringify(partial.weeklyHours));
+    await setSetting("weeklyHours", JSON.stringify(partial.weeklyHours));
   }
-  if (partial.meetingTitle !== undefined) setSetting("meetingTitle", partial.meetingTitle);
+  if (partial.meetingTitle !== undefined) {
+    await setSetting("meetingTitle", partial.meetingTitle);
+  }
 }
 
-export function listConnectedAccounts(): ConnectedAccount[] {
-  return getDb()
-    .prepare(`SELECT id, email FROM oauth_accounts ORDER BY email COLLATE NOCASE`)
-    .all() as ConnectedAccount[];
+export async function listConnectedAccounts(): Promise<ConnectedAccount[]> {
+  const res = await execute(
+    `SELECT id, email FROM oauth_accounts ORDER BY email COLLATE NOCASE`,
+  );
+  return res.rows.map((r) => ({
+    id: Number(r.id),
+    email: String(r.email),
+  }));
 }
 
-export function getAccountById(id: number): OAuthTokenRow | null {
-  const row = getDb()
-    .prepare(
-      `SELECT id,
-              email,
-              access_token_encrypted AS accessTokenEncrypted,
-              refresh_token_encrypted AS refreshTokenEncrypted,
-              expiry_date AS expiryDate
-       FROM oauth_accounts WHERE id = ?`,
-    )
-    .get(id) as OAuthTokenRow | undefined;
-  return row ?? null;
+export async function getAccountById(id: number): Promise<OAuthTokenRow | null> {
+  const res = await execute(
+    `SELECT id,
+            email,
+            access_token_encrypted AS accessTokenEncrypted,
+            refresh_token_encrypted AS refreshTokenEncrypted,
+            expiry_date AS expiryDate
+     FROM oauth_accounts WHERE id = ?`,
+    [id],
+  );
+  const row = res.rows[0];
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    email: String(row.email),
+    accessTokenEncrypted:
+      row.accessTokenEncrypted == null ? null : String(row.accessTokenEncrypted),
+    refreshTokenEncrypted: String(row.refreshTokenEncrypted),
+    expiryDate: row.expiryDate == null ? null : Number(row.expiryDate),
+  };
 }
 
-export function getAccountByEmail(email: string): OAuthTokenRow | null {
-  const row = getDb()
-    .prepare(
-      `SELECT id,
-              email,
-              access_token_encrypted AS accessTokenEncrypted,
-              refresh_token_encrypted AS refreshTokenEncrypted,
-              expiry_date AS expiryDate
-       FROM oauth_accounts WHERE email = ?`,
-    )
-    .get(email) as OAuthTokenRow | undefined;
-  return row ?? null;
+export async function getAccountByEmail(email: string): Promise<OAuthTokenRow | null> {
+  const res = await execute(
+    `SELECT id,
+            email,
+            access_token_encrypted AS accessTokenEncrypted,
+            refresh_token_encrypted AS refreshTokenEncrypted,
+            expiry_date AS expiryDate
+     FROM oauth_accounts WHERE email = ?`,
+    [email],
+  );
+  const row = res.rows[0];
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    email: String(row.email),
+    accessTokenEncrypted:
+      row.accessTokenEncrypted == null ? null : String(row.accessTokenEncrypted),
+    refreshTokenEncrypted: String(row.refreshTokenEncrypted),
+    expiryDate: row.expiryDate == null ? null : Number(row.expiryDate),
+  };
 }
 
 /** Upsert by email; returns account id. */
-export function saveOAuthAccount(input: {
+export async function saveOAuthAccount(input: {
   email: string;
   accessTokenEncrypted: string | null;
   refreshTokenEncrypted: string;
   expiryDate: number | null;
-}): number {
-  const existing = getAccountByEmail(input.email);
+}): Promise<number> {
+  const existing = await getAccountByEmail(input.email);
   const updatedAt = new Date().toISOString();
   if (existing) {
-    getDb()
-      .prepare(
-        `UPDATE oauth_accounts SET
-           access_token_encrypted = @accessTokenEncrypted,
-           refresh_token_encrypted = COALESCE(@refreshTokenEncrypted, refresh_token_encrypted),
-           expiry_date = @expiryDate,
-           updated_at = @updatedAt
-         WHERE id = @id`,
-      )
-      .run({
-        id: existing.id,
-        accessTokenEncrypted: input.accessTokenEncrypted,
-        refreshTokenEncrypted: input.refreshTokenEncrypted,
-        expiryDate: input.expiryDate,
+    await execute(
+      `UPDATE oauth_accounts SET
+         access_token_encrypted = ?,
+         refresh_token_encrypted = COALESCE(?, refresh_token_encrypted),
+         expiry_date = ?,
+         updated_at = ?
+       WHERE id = ?`,
+      [
+        input.accessTokenEncrypted,
+        input.refreshTokenEncrypted,
+        input.expiryDate,
         updatedAt,
-      });
+        existing.id,
+      ],
+    );
     return existing.id;
   }
-  const info = getDb()
-    .prepare(
-      `INSERT INTO oauth_accounts (email, access_token_encrypted, refresh_token_encrypted, expiry_date, updated_at)
-       VALUES (@email, @accessTokenEncrypted, @refreshTokenEncrypted, @expiryDate, @updatedAt)`,
-    )
-    .run({
-      email: input.email,
-      accessTokenEncrypted: input.accessTokenEncrypted,
-      refreshTokenEncrypted: input.refreshTokenEncrypted,
-      expiryDate: input.expiryDate,
+  const info = await execute(
+    `INSERT INTO oauth_accounts (email, access_token_encrypted, refresh_token_encrypted, expiry_date, updated_at)
+     VALUES (?, ?, ?, ?, ?)`,
+    [
+      input.email,
+      input.accessTokenEncrypted,
+      input.refreshTokenEncrypted,
+      input.expiryDate,
       updatedAt,
-    });
+    ],
+  );
   return Number(info.lastInsertRowid);
 }
 
-export function updateAccountTokens(
+export async function updateAccountTokens(
   accountId: number,
   input: {
     accessTokenEncrypted: string | null;
@@ -275,174 +352,176 @@ export function updateAccountTokens(
     expiryDate: number | null;
   },
 ) {
-  const current = getAccountById(accountId);
+  const current = await getAccountById(accountId);
   if (!current) return;
-  getDb()
-    .prepare(
-      `UPDATE oauth_accounts SET
-         access_token_encrypted = @accessTokenEncrypted,
-         refresh_token_encrypted = @refreshTokenEncrypted,
-         expiry_date = @expiryDate,
-         updated_at = @updatedAt
-       WHERE id = @id`,
-    )
-    .run({
-      id: accountId,
-      accessTokenEncrypted: input.accessTokenEncrypted,
-      refreshTokenEncrypted:
-        input.refreshTokenEncrypted ?? current.refreshTokenEncrypted,
-      expiryDate: input.expiryDate,
-      updatedAt: new Date().toISOString(),
-    });
+  await execute(
+    `UPDATE oauth_accounts SET
+       access_token_encrypted = ?,
+       refresh_token_encrypted = ?,
+       expiry_date = ?,
+       updated_at = ?
+     WHERE id = ?`,
+    [
+      input.accessTokenEncrypted,
+      input.refreshTokenEncrypted ?? current.refreshTokenEncrypted,
+      input.expiryDate,
+      new Date().toISOString(),
+      accountId,
+    ],
+  );
 }
 
-export function removeOAuthAccount(accountId: number) {
-  const db = getDb();
-  const tx = db.transaction(() => {
-    db.prepare("DELETE FROM calendars WHERE account_id = ?").run(accountId);
-    db.prepare("DELETE FROM oauth_accounts WHERE id = ?").run(accountId);
-  });
-  tx();
+export async function removeOAuthAccount(accountId: number) {
+  const db = await getDb();
+  await db.batch(
+    [
+      {
+        sql: "DELETE FROM calendars WHERE account_id = ?",
+        args: [accountId],
+      },
+      {
+        sql: "DELETE FROM oauth_accounts WHERE id = ?",
+        args: [accountId],
+      },
+    ],
+    "write",
+  );
 }
 
-export function listCalendars(): CalendarPref[] {
-  const rows = getDb()
-    .prepare(
-      `SELECT c.google_calendar_id AS googleCalendarId,
-              c.summary,
-              c.account_id AS accountId,
-              a.email AS accountEmail,
-              c.check_conflicts AS checkConflicts,
-              c.is_destination AS isDestination
-       FROM calendars c
-       JOIN oauth_accounts a ON a.id = c.account_id
-       ORDER BY a.email COLLATE NOCASE, c.summary COLLATE NOCASE`,
-    )
-    .all() as Array<{
-    googleCalendarId: string;
-    summary: string;
-    accountId: number;
-    accountEmail: string;
-    checkConflicts: number;
-    isDestination: number;
-  }>;
-  return rows.map((r) => ({
-    googleCalendarId: r.googleCalendarId,
-    summary: r.summary,
-    accountId: r.accountId,
-    accountEmail: r.accountEmail,
-    checkConflicts: Boolean(r.checkConflicts),
-    isDestination: Boolean(r.isDestination),
+export async function listCalendars(): Promise<CalendarPref[]> {
+  const res = await execute(
+    `SELECT c.google_calendar_id AS googleCalendarId,
+            c.summary,
+            c.account_id AS accountId,
+            a.email AS accountEmail,
+            c.check_conflicts AS checkConflicts,
+            c.is_destination AS isDestination
+     FROM calendars c
+     JOIN oauth_accounts a ON a.id = c.account_id
+     ORDER BY a.email COLLATE NOCASE, c.summary COLLATE NOCASE`,
+  );
+  return res.rows.map((r) => ({
+    googleCalendarId: String(r.googleCalendarId),
+    summary: String(r.summary),
+    accountId: Number(r.accountId),
+    accountEmail: String(r.accountEmail),
+    checkConflicts: Boolean(Number(r.checkConflicts)),
+    isDestination: Boolean(Number(r.isDestination)),
   }));
 }
 
-export function upsertCalendarsForAccount(
+export async function upsertCalendarsForAccount(
   accountId: number,
   calendars: Array<{ googleCalendarId: string; summary: string }>,
 ) {
-  const existing = new Map(
-    listCalendars()
-      .filter((c) => c.accountId === accountId)
-      .map((c) => [c.googleCalendarId, c]),
-  );
+  const existingList = (await listCalendars()).filter((c) => c.accountId === accountId);
+  const existing = new Map(existingList.map((c) => [c.googleCalendarId, c]));
   const seen = new Set(calendars.map((c) => c.googleCalendarId));
-  const upsert = getDb().prepare(
-    `INSERT INTO calendars (google_calendar_id, summary, account_id, check_conflicts, is_destination, updated_at)
-     VALUES (@id, @summary, @accountId, @checkConflicts, @isDestination, @updatedAt)
-     ON CONFLICT(google_calendar_id) DO UPDATE SET
-       summary = excluded.summary,
-       account_id = excluded.account_id,
-       updated_at = excluded.updated_at`,
-  );
-  const del = getDb().prepare(
-    `DELETE FROM calendars WHERE account_id = ? AND google_calendar_id = ?`,
-  );
   const now = new Date().toISOString();
-  const tx = getDb().transaction(() => {
-    for (const cal of calendars) {
-      const prev = existing.get(cal.googleCalendarId);
-      upsert.run({
-        id: cal.googleCalendarId,
-        summary: cal.summary,
+  const stmts: Array<{ sql: string; args: InArgs }> = [];
+
+  for (const cal of calendars) {
+    const prev = existing.get(cal.googleCalendarId);
+    stmts.push({
+      sql: `INSERT INTO calendars (google_calendar_id, summary, account_id, check_conflicts, is_destination, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(google_calendar_id) DO UPDATE SET
+              summary = excluded.summary,
+              account_id = excluded.account_id,
+              updated_at = excluded.updated_at`,
+      args: [
+        cal.googleCalendarId,
+        cal.summary,
         accountId,
-        checkConflicts: prev?.checkConflicts !== false ? 1 : 0,
-        isDestination: prev?.isDestination ? 1 : 0,
-        updatedAt: now,
+        prev?.checkConflicts !== false ? 1 : 0,
+        prev?.isDestination ? 1 : 0,
+        now,
+      ],
+    });
+  }
+  for (const prev of existing.values()) {
+    if (!seen.has(prev.googleCalendarId)) {
+      stmts.push({
+        sql: `DELETE FROM calendars WHERE account_id = ? AND google_calendar_id = ?`,
+        args: [accountId, prev.googleCalendarId],
       });
     }
-    for (const prev of existing.values()) {
-      if (!seen.has(prev.googleCalendarId)) {
-        del.run(accountId, prev.googleCalendarId);
-      }
-    }
-  });
-  tx();
+  }
+
+  if (stmts.length === 0) return;
+  const db = await getDb();
+  await db.batch(stmts, "write");
 }
 
-export function updateCalendarPrefs(
+export async function updateCalendarPrefs(
   prefs: Array<{
     googleCalendarId: string;
     checkConflicts: boolean;
     isDestination: boolean;
   }>,
 ) {
-  const update = getDb().prepare(
-    `UPDATE calendars
-     SET check_conflicts = @checkConflicts,
-         is_destination = @isDestination,
-         updated_at = @updatedAt
-     WHERE google_calendar_id = @id`,
-  );
-  const clearDest = getDb().prepare("UPDATE calendars SET is_destination = 0");
   const now = new Date().toISOString();
-  const tx = getDb().transaction(() => {
-    clearDest.run();
-    for (const p of prefs) {
-      update.run({
-        id: p.googleCalendarId,
-        checkConflicts: p.checkConflicts ? 1 : 0,
-        isDestination: p.isDestination ? 1 : 0,
-        updatedAt: now,
-      });
-    }
-  });
-  tx();
+  const stmts: Array<{ sql: string; args: InArgs }> = [
+    { sql: "UPDATE calendars SET is_destination = 0", args: [] },
+  ];
+  for (const p of prefs) {
+    stmts.push({
+      sql: `UPDATE calendars
+            SET check_conflicts = ?,
+                is_destination = ?,
+                updated_at = ?
+            WHERE google_calendar_id = ?`,
+      args: [
+        p.checkConflicts ? 1 : 0,
+        p.isDestination ? 1 : 0,
+        now,
+        p.googleCalendarId,
+      ],
+    });
+  }
+  const db = await getDb();
+  await db.batch(stmts, "write");
 }
 
-export function getDestinationCalendar(): {
+export async function getDestinationCalendar(): Promise<{
   googleCalendarId: string;
   accountId: number;
-} | null {
-  const row = getDb()
-    .prepare(
-      `SELECT google_calendar_id AS googleCalendarId, account_id AS accountId
-       FROM calendars WHERE is_destination = 1 LIMIT 1`,
-    )
-    .get() as { googleCalendarId: string; accountId: number } | undefined;
-  return row ?? null;
+} | null> {
+  const res = await execute(
+    `SELECT google_calendar_id AS googleCalendarId, account_id AS accountId
+     FROM calendars WHERE is_destination = 1 LIMIT 1`,
+  );
+  const row = res.rows[0];
+  if (!row) return null;
+  return {
+    googleCalendarId: String(row.googleCalendarId),
+    accountId: Number(row.accountId),
+  };
 }
 
-export function getConflictCalendars(): Array<{
-  googleCalendarId: string;
-  accountId: number;
-}> {
-  return getDb()
-    .prepare(
-      `SELECT google_calendar_id AS googleCalendarId, account_id AS accountId
-       FROM calendars WHERE check_conflicts = 1`,
-    )
-    .all() as Array<{ googleCalendarId: string; accountId: number }>;
+export async function getConflictCalendars(): Promise<
+  Array<{
+    googleCalendarId: string;
+    accountId: number;
+  }>
+> {
+  const res = await execute(
+    `SELECT google_calendar_id AS googleCalendarId, account_id AS accountId
+     FROM calendars WHERE check_conflicts = 1`,
+  );
+  return res.rows.map((r) => ({
+    googleCalendarId: String(r.googleCalendarId),
+    accountId: Number(r.accountId),
+  }));
 }
 
-export function findHostBySlug(slug: string): HostSettings | null {
-  const settings = getHostSettings();
+export async function findHostBySlug(slug: string): Promise<HostSettings | null> {
+  const settings = await getHostSettings();
   if (settings.slug !== slug) return null;
   return settings;
 }
 
-export function hasAnyGoogleAccount(): boolean {
-  const row = getDb().prepare("SELECT COUNT(*) AS c FROM oauth_accounts").get() as {
-    c: number;
-  };
-  return row.c > 0;
+export async function hasAnyGoogleAccount(): Promise<boolean> {
+  const res = await execute("SELECT COUNT(*) AS c FROM oauth_accounts");
+  return Number(res.rows[0]?.c ?? 0) > 0;
 }
