@@ -1,63 +1,42 @@
-import Image from "next/image";
+import Link from "next/link";
+import { getHostSettings } from "@/lib/db";
 
-export default function Home() {
+export const dynamic = "force-dynamic";
+
+export default function HomePage() {
+  const settings = getHostSettings();
+  const name = settings.hostName || "Chris";
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
+    <div className="page-shell">
+      <main className="page-content mx-auto flex min-h-screen max-w-xl flex-col justify-center px-6 py-20">
+        <div className="animate-rise">
+          <p className="text-[0.7rem] font-semibold uppercase tracking-[0.22em] text-accent">
+            Scheduling
+          </p>
+          <div className="accent-rule mt-4" />
+          <h1 className="font-display mt-6 text-[2.75rem] leading-[1.05] tracking-[-0.02em] text-ink-soft sm:text-5xl">
+            Book with <span className="text-accent">{name}</span>
           </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+          <p className="mt-5 max-w-md text-[1.05rem] leading-relaxed text-muted">
+            Choose a length, pick an open time across calendars, and get an invite —
+            simple as that.
           </p>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+
+        <div className="animate-rise-delay-1 mt-10 flex flex-wrap items-center gap-3">
+          <Link
+            href={`/book/${settings.slug}`}
+            className="rounded-md bg-accent px-5 py-3 text-sm font-semibold text-white shadow-[0_10px_28px_-14px_rgba(26,107,85,0.7)] transition hover:bg-accent-hover hover:shadow-[0_12px_30px_-12px_rgba(26,107,85,0.75)]"
           >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+            Book a meeting
+          </Link>
+          <Link
+            href="/admin"
+            className="rounded-md border border-border/80 bg-surface/70 px-5 py-3 text-sm font-medium text-ink-soft backdrop-blur-sm transition hover:border-accent/30 hover:bg-surface"
           >
-            Documentation
-          </a>
+            Admin
+          </Link>
         </div>
       </main>
     </div>
