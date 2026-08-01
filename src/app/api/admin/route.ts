@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import {
   getHostSettings,
+  getStorageBackend,
   listCalendars,
   listConnectedAccounts,
   removeOAuthAccount,
@@ -24,15 +25,16 @@ async function assertAdmin() {
   return session;
 }
 
-function adminPayload() {
-  const settings = getHostSettings();
+async function adminPayload() {
+  const settings = await getHostSettings();
   return {
     authenticated: true,
-    googleConnected: isGoogleConnected(),
-    googleEmails: getConnectedEmails(),
-    accounts: listConnectedAccounts(),
+    googleConnected: await isGoogleConnected(),
+    googleEmails: await getConnectedEmails(),
+    accounts: await listConnectedAccounts(),
     settings,
-    calendars: listCalendars(),
+    calendars: await listCalendars(),
+    storageBackend: getStorageBackend(),
     bookingUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? ""}/book/${settings.slug}`,
   };
 }
@@ -43,7 +45,7 @@ export async function GET() {
     if (!session) {
       return NextResponse.json({ authenticated: false }, { status: 401 });
     }
-    return NextResponse.json(adminPayload());
+    return NextResponse.json(await adminPayload());
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to load admin";
     return NextResponse.json({ error: message }, { status: 500 });
@@ -99,7 +101,7 @@ export async function PUT(request: Request) {
     };
 
     if (typeof body.removeAccountId === "number") {
-      removeOAuthAccount(body.removeAccountId);
+      await removeOAuthAccount(body.removeAccountId);
     }
 
     if (body.refreshCalendars) {
@@ -108,7 +110,7 @@ export async function PUT(request: Request) {
 
     if (body.settings) {
       const settings = settingsSchema.parse(body.settings);
-      updateHostSettings({
+      await updateHostSettings({
         ...settings,
         weeklyHours: settings.weeklyHours as WeeklyHours,
       });
@@ -123,10 +125,10 @@ export async function PUT(request: Request) {
           { status: 400 },
         );
       }
-      updateCalendarPrefs(calendars);
+      await updateCalendarPrefs(calendars);
     }
 
-    return NextResponse.json({ ok: true, ...adminPayload() });
+    return NextResponse.json({ ok: true, ...(await adminPayload()) });
   } catch (err) {
     if (err instanceof z.ZodError) {
       return NextResponse.json(

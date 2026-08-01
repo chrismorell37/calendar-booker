@@ -32,6 +32,8 @@ type AdminData = {
   settings?: HostSettings;
   calendars?: CalendarPref[];
   bookingUrl?: string;
+  /** "turso" on Vercel; "local-file" only for local dev */
+  storageBackend?: "turso" | "local-file";
 };
 
 export default function AdminPage() {
@@ -344,6 +346,20 @@ export default function AdminPage() {
           Connect personal and work Google accounts. Mark calendars to check for
           conflicts; pick one calendar to receive bookings.
         </p>
+
+        {data.storageBackend && (
+          <p
+            className={`mt-3 rounded-md border px-3 py-2 text-xs ${
+              data.storageBackend === "turso"
+                ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+                : "border-amber-200 bg-amber-50 text-amber-950"
+            }`}
+          >
+            {data.storageBackend === "turso"
+              ? "Persistent storage: Turso (connections survive redeploys)."
+              : "Storage: local file DB (dev only). On Vercel this must show Turso or calendars will keep disconnecting."}
+          </p>
+        )}
 
         {(data.accounts?.length ?? 0) > 0 && (
           <ul className="mt-4 space-y-2">

@@ -25,21 +25,21 @@ export async function POST(request: Request) {
     const guestEmails = (body.guestEmails ?? []).filter(
       (e) => e.toLowerCase() !== body.email.toLowerCase(),
     );
-    const settings = findHostBySlug(body.slug);
+    const settings = await findHostBySlug(body.slug);
     if (!settings) {
       return NextResponse.json({ error: "Booking page not found" }, { status: 404 });
     }
     if (!settings.durations.includes(body.duration)) {
       return NextResponse.json({ error: "Invalid duration" }, { status: 400 });
     }
-    if (!hasAnyGoogleAccount()) {
+    if (!(await hasAnyGoogleAccount())) {
       return NextResponse.json(
         { error: "Host has not connected Google Calendar yet" },
         { status: 503 },
       );
     }
 
-    const destination = getDestinationCalendar();
+    const destination = await getDestinationCalendar();
     if (!destination) {
       return NextResponse.json(
         { error: "Host has not chosen a destination calendar" },

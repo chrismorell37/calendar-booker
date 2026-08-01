@@ -20,14 +20,14 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: "Invalid date" }, { status: 400 });
     }
 
-    const settings = findHostBySlug(slug);
+    const settings = await findHostBySlug(slug);
     if (!settings) {
       return NextResponse.json({ error: "Booking page not found" }, { status: 404 });
     }
     if (!settings.durations.includes(duration)) {
       return NextResponse.json({ error: "Invalid duration" }, { status: 400 });
     }
-    if (!hasAnyGoogleAccount()) {
+    if (!(await hasAnyGoogleAccount())) {
       return NextResponse.json(
         { error: "Host has not connected Google Calendar yet" },
         { status: 503 },

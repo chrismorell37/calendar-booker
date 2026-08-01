@@ -9,7 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "better-sqlite3": "^13.0.2",
+    "@libsql/client": "^0.17.4",
     "date-fns": "^4.4.0",
     "date-fns-tz": "^3.2.0",
     "googleapis": "^173.0.0",
@@ -21,7 +21,6 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
-    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",

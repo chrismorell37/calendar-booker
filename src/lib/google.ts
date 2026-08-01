@@ -56,7 +56,7 @@ export async function exchangeCodeForTokens(code: string) {
   if (!email) {
     throw new Error("Google did not return an email for this account");
   }
-  const accountId = saveOAuthAccount({
+  const accountId = await saveOAuthAccount({
     accessTokenEncrypted: tokens.access_token ? encrypt(tokens.access_token) : null,
     refreshTokenEncrypted: encrypt(tokens.refresh_token),
     expiryDate: tokens.expiry_date ?? null,
@@ -66,8 +66,29 @@ export async function exchangeCodeForTokens(code: string) {
   return { email, accountId };
 }
 
+async function persistRefreshedTokens(
+  accountId: number,
+  tokens: {
+    access_token?: string | null;
+    refresh_token?: string | null;
+    expiry_date?: number | null;
+  },
+) {
+  const current = await getAccountById(accountId);
+  if (!current) return;
+  await updateAccountTokens(accountId, {
+    accessTokenEncrypted: tokens.access_token
+      ? encrypt(tokens.access_token)
+      : current.accessTokenEncrypted,
+    refreshTokenEncrypted: tokens.refresh_token
+      ? encrypt(tokens.refresh_token)
+      : undefined,
+    expiryDate: tokens.expiry_date ?? current.expiryDate,
+  });
+}
+
 async function getAuthedClient(accountId: number) {
-  const stored = getAccountById(accountId);
+  const stored = await getAccountById(accountId);
   if (!stored) {
     throw new Error("Google account not connected");
   }
@@ -80,17 +101,21 @@ async function getAuthedClient(accountId: number) {
     expiry_date: stored.expiryDate ?? undefined,
   });
 
+  // On serverless, await token persistence — fire-and-forget can be dropped
+  // when the isolate freezes after the response is sent.
+  const needsRefresh =
+    !stored.accessTokenEncrypted ||
+    !stored.expiryDate ||
+    stored.expiryDate <= Date.now() + 60_000;
+  if (needsRefresh) {
+    const { credentials } = await client.refreshAccessToken();
+    await persistRefreshedTokens(accountId, credentials);
+    client.setCredentials(credentials);
+  }
+
   client.on("tokens", (tokens) => {
-    const current = getAccountById(accountId);
-    if (!current) return;
-    updateAccountTokens(accountId, {
-      accessTokenEncrypted: tokens.access_token
-        ? encrypt(tokens.access_token)
-        : current.accessTokenEncrypted,
-      refreshTokenEncrypted: tokens.refresh_token
-        ? encrypt(tokens.refresh_token)
-        : undefined,
-      expiryDate: tokens.expiry_date ?? current.expiryDate,
+    void persistRefreshedTokens(accountId, tokens).catch((err) => {
+      console.error("Failed to persist refreshed Google tokens", err);
     });
   });
 
@@ -107,13 +132,13 @@ export async function refreshCalendarListForAccount(accountId: number) {
       googleCalendarId: c.id!,
       summary: c.summary!,
     }));
-  upsertCalendarsForAccount(accountId, items);
+  await upsertCalendarsForAccount(accountId, items);
 
-  const prefs = listCalendars();
+  const prefs = await listCalendars();
   if (!prefs.some((p) => p.isDestination) && items.length > 0) {
     const primary =
       (res.data.items ?? []).find((c) => c.primary)?.id ?? items[0].googleCalendarId;
-    updateCalendarPrefs(
+    await updateCalendarPrefs(
       prefs.map((p) => ({
         googleCalendarId: p.googleCalendarId,
         checkConflicts: true,
@@ -126,7 +151,7 @@ export async function refreshCalendarListForAccount(accountId: number) {
 }
 
 export async function refreshCalendarList() {
-  const accounts = listConnectedAccounts();
+  const accounts = await listConnectedAccounts();
   if (accounts.length === 0) {
     throw new Error("No Google accounts connected");
   }
@@ -142,7 +167,7 @@ export async function queryFreeBusy(
   timeMin: Date,
   timeMax: Date,
 ): Promise<BusyPeriod[]> {
-  const conflictCals = getConflictCalendars();
+  const conflictCals = await getConflictCalendars();
   if (conflictCals.length === 0) return [];
 
   const byAccount = new Map<number, string[]>();
@@ -186,14 +211,15 @@ export async function createCalendarEvent(input: {
   attendeeName: string;
   additionalGuestEmails?: string[];
 }) {
-  const destination = getDestinationCalendar();
+  const destination = await getDestinationCalendar();
   if (!destination || destination.googleCalendarId !== input.calendarId) {
     // Still allow explicit calendarId if it matches a known calendar
   }
   const accountId =
     destination?.googleCalendarId === input.calendarId
       ? destination.accountId
-      : listCalendars().find((c) => c.googleCalendarId === input.calendarId)?.accountId;
+      : (await listCalendars()).find((c) => c.googleCalendarId === input.calendarId)
+          ?.accountId;
 
   if (!accountId) {
     throw new Error("Destination calendar is not linked to a Google account");
@@ -240,10 +266,10 @@ export async function createCalendarEvent(input: {
   return res.data;
 }
 
-export function isGoogleConnected(): boolean {
+export async function isGoogleConnected(): Promise<boolean> {
   return hasAnyGoogleAccount();
 }
 
-export function getConnectedEmails(): string[] {
-  return listConnectedAccounts().map((a) => a.email);
+export async function getConnectedEmails(): Promise<string[]> {
+  return (await listConnectedAccounts()).map((a) => a.email);
 }
