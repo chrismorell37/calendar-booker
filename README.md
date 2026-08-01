@@ -45,7 +45,14 @@ turso db show calendar-booker --url          # → TURSO_DATABASE_URL
 turso db tokens create calendar-booker       # → TURSO_AUTH_TOKEN
 ```
 
-Add both values in the Vercel project env settings, then redeploy.
+Add both values in the Vercel project → **Settings → Environment Variables** for the
+**Production** environment (not only Preview), then **merge this code to `main`** and
+redeploy production. Preview deploys alone will not fix `calendar-booker.vercel.app`.
+
+After production is on Turso, open `/admin` — you should see
+“Persistent storage: Turso”. Then reconnect Google once (old `/tmp` tokens cannot migrate).
+
+Keep `TOKEN_ENCRYPTION_KEY` stable across deploys; changing it makes stored tokens unreadable.
 
 4. **Run**
 

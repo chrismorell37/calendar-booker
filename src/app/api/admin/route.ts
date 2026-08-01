@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import {
   getHostSettings,
+  getStorageBackend,
   listCalendars,
   listConnectedAccounts,
   removeOAuthAccount,
@@ -33,6 +34,7 @@ async function adminPayload() {
     accounts: await listConnectedAccounts(),
     settings,
     calendars: await listCalendars(),
+    storageBackend: getStorageBackend(),
     bookingUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? ""}/book/${settings.slug}`,
   };
 }

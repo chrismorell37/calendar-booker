@@ -66,6 +66,27 @@ export async function exchangeCodeForTokens(code: string) {
   return { email, accountId };
 }
 
+async function persistRefreshedTokens(
+  accountId: number,
+  tokens: {
+    access_token?: string | null;
+    refresh_token?: string | null;
+    expiry_date?: number | null;
+  },
+) {
+  const current = await getAccountById(accountId);
+  if (!current) return;
+  await updateAccountTokens(accountId, {
+    accessTokenEncrypted: tokens.access_token
+      ? encrypt(tokens.access_token)
+      : current.accessTokenEncrypted,
+    refreshTokenEncrypted: tokens.refresh_token
+      ? encrypt(tokens.refresh_token)
+      : undefined,
+    expiryDate: tokens.expiry_date ?? current.expiryDate,
+  });
+}
+
 async function getAuthedClient(accountId: number) {
   const stored = await getAccountById(accountId);
   if (!stored) {
@@ -80,20 +101,22 @@ async function getAuthedClient(accountId: number) {
     expiry_date: stored.expiryDate ?? undefined,
   });
 
+  // On serverless, await token persistence — fire-and-forget can be dropped
+  // when the isolate freezes after the response is sent.
+  const needsRefresh =
+    !stored.accessTokenEncrypted ||
+    !stored.expiryDate ||
+    stored.expiryDate <= Date.now() + 60_000;
+  if (needsRefresh) {
+    const { credentials } = await client.refreshAccessToken();
+    await persistRefreshedTokens(accountId, credentials);
+    client.setCredentials(credentials);
+  }
+
   client.on("tokens", (tokens) => {
-    void (async () => {
-      const current = await getAccountById(accountId);
-      if (!current) return;
-      await updateAccountTokens(accountId, {
-        accessTokenEncrypted: tokens.access_token
-          ? encrypt(tokens.access_token)
-          : current.accessTokenEncrypted,
-        refreshTokenEncrypted: tokens.refresh_token
-          ? encrypt(tokens.refresh_token)
-          : undefined,
-        expiryDate: tokens.expiry_date ?? current.expiryDate,
-      });
-    })();
+    void persistRefreshedTokens(accountId, tokens).catch((err) => {
+      console.error("Failed to persist refreshed Google tokens", err);
+    });
   });
 
   return client;

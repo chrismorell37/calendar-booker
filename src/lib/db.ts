@@ -11,13 +11,25 @@ import {
 } from "./types";
 
 let clientInstance: Client | null = null;
-let initPromise: Promise<void> | null = null;
+let initPromise: Promise<Client> | null = null;
+
+export type StorageBackend = "turso" | "local-file";
+
+/** Which persistence backend is active (does not open a connection). */
+export function getStorageBackend(): StorageBackend {
+  return process.env.TURSO_DATABASE_URL ? "turso" : "local-file";
+}
 
 function createDbClient(): Client {
-  const tursoUrl = process.env.TURSO_DATABASE_URL;
-  const tursoToken = process.env.TURSO_AUTH_TOKEN;
+  const tursoUrl = process.env.TURSO_DATABASE_URL?.trim();
+  const tursoToken = process.env.TURSO_AUTH_TOKEN?.trim();
 
   if (tursoUrl) {
+    if (!tursoToken) {
+      throw new Error(
+        "TURSO_AUTH_TOKEN is required when TURSO_DATABASE_URL is set.",
+      );
+    }
     return createClient({
       url: tursoUrl,
       authToken: tursoToken,
@@ -28,7 +40,7 @@ function createDbClient(): Client {
   // so OAuth tokens and calendar prefs appear to "disconnect" within minutes.
   if (process.env.VERCEL) {
     throw new Error(
-      "Persistent storage required on Vercel. Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN (see README).",
+      "Persistent storage required on Vercel. Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN (Production env), merge this fix to main, redeploy, then reconnect Google in /admin.",
     );
   }
 
@@ -145,43 +157,55 @@ async function seedDefaults(client: Client) {
 }
 
 async function ensureDb(): Promise<Client> {
-  if (clientInstance && initPromise) {
-    await initPromise;
-    return clientInstance;
-  }
-  clientInstance = createDbClient();
+  if (clientInstance) return clientInstance;
+  if (initPromise) return initPromise;
+
   initPromise = (async () => {
-    const client = clientInstance!;
-    await client.executeMultiple(`
-      CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
+    const client = createDbClient();
+    try {
+      await client.executeMultiple(`
+        CREATE TABLE IF NOT EXISTS settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
 
-      CREATE TABLE IF NOT EXISTS oauth_accounts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT NOT NULL UNIQUE,
-        access_token_encrypted TEXT,
-        refresh_token_encrypted TEXT NOT NULL,
-        expiry_date INTEGER,
-        updated_at TEXT NOT NULL
-      );
+        CREATE TABLE IF NOT EXISTS oauth_accounts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          email TEXT NOT NULL UNIQUE,
+          access_token_encrypted TEXT,
+          refresh_token_encrypted TEXT NOT NULL,
+          expiry_date INTEGER,
+          updated_at TEXT NOT NULL
+        );
 
-      CREATE TABLE IF NOT EXISTS calendars (
-        google_calendar_id TEXT PRIMARY KEY,
-        summary TEXT NOT NULL,
-        account_id INTEGER NOT NULL,
-        check_conflicts INTEGER NOT NULL DEFAULT 1,
-        is_destination INTEGER NOT NULL DEFAULT 0,
-        updated_at TEXT NOT NULL,
-        FOREIGN KEY (account_id) REFERENCES oauth_accounts(id) ON DELETE CASCADE
-      );
-    `);
-    await migrateLegacy(client);
-    await seedDefaults(client);
+        CREATE TABLE IF NOT EXISTS calendars (
+          google_calendar_id TEXT PRIMARY KEY,
+          summary TEXT NOT NULL,
+          account_id INTEGER NOT NULL,
+          check_conflicts INTEGER NOT NULL DEFAULT 1,
+          is_destination INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY (account_id) REFERENCES oauth_accounts(id) ON DELETE CASCADE
+        );
+      `);
+      await migrateLegacy(client);
+      await seedDefaults(client);
+      clientInstance = client;
+      return client;
+    } catch (err) {
+      // Allow the next request to retry after a failed cold start / Turso blip.
+      initPromise = null;
+      clientInstance = null;
+      try {
+        client.close();
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
   })();
-  await initPromise;
-  return clientInstance;
+
+  return initPromise;
 }
 
 async function getDb(): Promise<Client> {
