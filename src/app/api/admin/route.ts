@@ -25,7 +25,23 @@ async function assertAdmin() {
   return session;
 }
 
-async function adminPayload() {
+function appBaseUrl(request?: Request) {
+  const fromEnv = process.env.NEXT_PUBLIC_APP_URL?.replace(/\/$/, "");
+  if (fromEnv && !fromEnv.includes("localhost")) return fromEnv;
+
+  if (request) {
+    const host =
+      request.headers.get("x-forwarded-host") ?? request.headers.get("host");
+    const proto =
+      request.headers.get("x-forwarded-proto") ??
+      (host?.includes("localhost") ? "http" : "https");
+    if (host) return `${proto}://${host}`;
+  }
+
+  return fromEnv || "http://localhost:3000";
+}
+
+async function adminPayload(request?: Request) {
   const settings = await getHostSettings();
   return {
     authenticated: true,
@@ -35,17 +51,17 @@ async function adminPayload() {
     settings,
     calendars: await listCalendars(),
     storageBackend: getStorageBackend(),
-    bookingUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? ""}/book/${settings.slug}`,
+    bookingUrl: `${appBaseUrl(request)}/book/${settings.slug}`,
   };
 }
 
-export async function GET() {
+export async function GET(request: Request) {
   try {
     const session = await assertAdmin();
     if (!session) {
       return NextResponse.json({ authenticated: false }, { status: 401 });
     }
-    return NextResponse.json(await adminPayload());
+    return NextResponse.json(await adminPayload(request));
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to load admin";
     return NextResponse.json({ error: message }, { status: 500 });
@@ -128,7 +144,7 @@ export async function PUT(request: Request) {
       await updateCalendarPrefs(calendars);
     }
 
-    return NextResponse.json({ ok: true, ...(await adminPayload()) });
+    return NextResponse.json({ ok: true, ...(await adminPayload(request)) });
   } catch (err) {
     if (err instanceof z.ZodError) {
       return NextResponse.json(

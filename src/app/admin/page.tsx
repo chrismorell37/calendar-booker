@@ -251,12 +251,12 @@ export default function AdminPage() {
   }, [calendars]);
 
   const bookingUrl = useMemo(() => {
-    if (data?.bookingUrl) return data.bookingUrl;
-    if (settings) {
-      const base = typeof window !== "undefined" ? window.location.origin : "";
-      return `${base}/book/${settings.slug}`;
-    }
-    return "";
+    if (!settings) return "";
+    const origin =
+      typeof window !== "undefined" ? window.location.origin : "";
+    // Prefer the browser origin so Vercel never shows a leftover localhost env value
+    if (origin) return `${origin}/book/${settings.slug}`;
+    return data?.bookingUrl ?? "";
   }, [data?.bookingUrl, settings]);
 
   if (loading) {
