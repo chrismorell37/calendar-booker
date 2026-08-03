@@ -6,7 +6,11 @@ import {
   getDestinationCalendar,
   hasAnyGoogleAccount,
 } from "@/lib/db";
-import { createCalendarEvent, queryFreeBusy } from "@/lib/google";
+import {
+  createCalendarEvent,
+  notifyHostOfBooking,
+  queryFreeBusy,
+} from "@/lib/google";
 import { generateOpenSlots, getDayBounds } from "@/lib/slots";
 
 const bookSchema = z.object({
@@ -95,14 +99,39 @@ export async function POST(request: Request) {
       additionalGuestEmails: guestEmails,
     });
 
+    const hangoutLink =
+      event.hangoutLink ??
+      event.conferenceData?.entryPoints?.find((e) => e.entryPointType === "video")
+        ?.uri;
+
+    const notifyEmail =
+      process.env.HOST_NOTIFY_EMAIL?.trim() || settings.notifyEmail.trim();
+    if (notifyEmail) {
+      try {
+        await notifyHostOfBooking({
+          to: notifyEmail,
+          guestName: body.name,
+          guestEmail: body.email,
+          guestEmails,
+          notes: body.notes,
+          summary,
+          start,
+          end,
+          timezone: settings.timezone,
+          hangoutLink,
+          htmlLink: event.htmlLink,
+        });
+      } catch (err) {
+        // Booking already succeeded; don't fail the guest over host email issues.
+        console.error("Failed to send host booking notification", err);
+      }
+    }
+
     return NextResponse.json({
       ok: true,
       eventId: event.id,
       htmlLink: event.htmlLink,
-      hangoutLink:
-        event.hangoutLink ??
-        event.conferenceData?.entryPoints?.find((e) => e.entryPointType === "video")
-          ?.uri,
+      hangoutLink,
       start: start.toISOString(),
       end: end.toISOString(),
       timezone: settings.timezone,

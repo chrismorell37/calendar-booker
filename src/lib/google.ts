@@ -13,9 +13,10 @@ import {
   upsertCalendarsForAccount,
 } from "./db";
 
-// Full calendar scope covers list, freebusy, and create events.
+// Calendar for availability/booking; Gmail send for host booking alerts.
 const SCOPES = [
   "https://www.googleapis.com/auth/calendar",
+  "https://www.googleapis.com/auth/gmail.send",
   "https://www.googleapis.com/auth/userinfo.email",
 ];
 
@@ -272,4 +273,109 @@ export async function isGoogleConnected(): Promise<boolean> {
 
 export async function getConnectedEmails(): Promise<string[]> {
   return (await listConnectedAccounts()).map((a) => a.email);
+}
+
+function encodeRfc2047Subject(subject: string): string {
+  if (/^[\x20-\x7E]*$/.test(subject)) return subject;
+  return `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`;
+}
+
+function toBase64Url(raw: string): string {
+  return Buffer.from(raw, "utf8")
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+/** Send a plain-text email from a connected Google account via Gmail API. */
+export async function sendGmailMessage(input: {
+  accountId: number;
+  to: string;
+  subject: string;
+  body: string;
+}) {
+  const auth = await getAuthedClient(input.accountId);
+  const gmail = google.gmail({ version: "v1", auth });
+  const fromAccount = await getAccountById(input.accountId);
+  const bodyBase64 = Buffer.from(input.body, "utf8").toString("base64");
+  const headers = [
+    ...(fromAccount?.email ? [`From: ${fromAccount.email}`] : []),
+    `To: ${input.to}`,
+    `Subject: ${encodeRfc2047Subject(input.subject)}`,
+    "MIME-Version: 1.0",
+    'Content-Type: text/plain; charset="UTF-8"',
+    "Content-Transfer-Encoding: base64",
+  ];
+  const mime = [...headers, "", bodyBase64].join("\r\n");
+
+  await gmail.users.messages.send({
+    userId: "me",
+    requestBody: { raw: toBase64Url(mime) },
+  });
+}
+
+export async function notifyHostOfBooking(input: {
+  to: string;
+  guestName: string;
+  guestEmail: string;
+  guestEmails?: string[];
+  notes?: string;
+  summary: string;
+  start: Date;
+  end: Date;
+  timezone: string;
+  hangoutLink?: string | null;
+  htmlLink?: string | null;
+}) {
+  const to = input.to.trim();
+  if (!to) return;
+
+  const destination = await getDestinationCalendar();
+  if (!destination) {
+    throw new Error("No destination calendar for host notification email");
+  }
+
+  const when = new Intl.DateTimeFormat("en-US", {
+    timeZone: input.timezone,
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(input.start);
+
+  const durationMins = Math.round(
+    (input.end.getTime() - input.start.getTime()) / 60_000,
+  );
+
+  const lines = [
+    "A new meeting was booked on your booking page.",
+    "",
+    `Title: ${input.summary}`,
+    `When: ${when}`,
+    `Duration: ${durationMins} minutes`,
+    `Guest: ${input.guestName} <${input.guestEmail}>`,
+  ];
+  if (input.guestEmails?.length) {
+    lines.push(`Additional guests: ${input.guestEmails.join(", ")}`);
+  }
+  if (input.notes?.trim()) {
+    lines.push(`Notes: ${input.notes.trim()}`);
+  }
+  if (input.hangoutLink) {
+    lines.push(`Meet: ${input.hangoutLink}`);
+  }
+  if (input.htmlLink) {
+    lines.push(`Calendar: ${input.htmlLink}`);
+  }
+
+  await sendGmailMessage({
+    accountId: destination.accountId,
+    to,
+    subject: `New booking: ${input.summary}`,
+    body: lines.join("\n"),
+  });
 }

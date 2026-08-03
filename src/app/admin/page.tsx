@@ -453,6 +453,23 @@ export default function AdminPage() {
               onChange={(e) => setSettings({ ...settings, hostName: e.target.value })}
             />
           </label>
+          <label className="block text-sm sm:col-span-2">
+            <span className="text-muted">Notify email on new bookings</span>
+            <input
+              type="email"
+              className="mt-1 w-full rounded-md border border-border px-3 py-2"
+              value={settings.notifyEmail}
+              onChange={(e) =>
+                setSettings({ ...settings, notifyEmail: e.target.value })
+              }
+              placeholder="you@example.com"
+            />
+            <span className="mt-1 block text-xs text-muted">
+              Sent from your connected Google account via Gmail. Leave blank to
+              disable. Reconnect Google after deploying if you haven&apos;t
+              granted Gmail send permission yet.
+            </span>
+          </label>
           <label className="block text-sm">
             <span className="text-muted">URL slug</span>
             <input

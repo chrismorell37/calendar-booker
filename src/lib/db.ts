@@ -129,6 +129,10 @@ async function seedDefaults(client: Client) {
       },
       {
         sql: "INSERT INTO settings (key, value) VALUES (?, ?)",
+        args: ["notifyEmail", DEFAULT_SETTINGS.notifyEmail],
+      },
+      {
+        sql: "INSERT INTO settings (key, value) VALUES (?, ?)",
         args: ["timezone", DEFAULT_SETTINGS.timezone],
       },
       {
@@ -235,6 +239,8 @@ export async function getHostSettings(): Promise<HostSettings> {
   return {
     slug: (await getSetting("slug")) ?? DEFAULT_SETTINGS.slug,
     hostName: (await getSetting("hostName")) ?? DEFAULT_SETTINGS.hostName,
+    notifyEmail:
+      (await getSetting("notifyEmail")) ?? DEFAULT_SETTINGS.notifyEmail,
     timezone: (await getSetting("timezone")) ?? DEFAULT_SETTINGS.timezone,
     bufferMinutes: Number(
       (await getSetting("bufferMinutes")) ?? DEFAULT_SETTINGS.bufferMinutes,
@@ -255,6 +261,9 @@ export async function getHostSettings(): Promise<HostSettings> {
 export async function updateHostSettings(partial: Partial<HostSettings>) {
   if (partial.slug !== undefined) await setSetting("slug", partial.slug);
   if (partial.hostName !== undefined) await setSetting("hostName", partial.hostName);
+  if (partial.notifyEmail !== undefined) {
+    await setSetting("notifyEmail", partial.notifyEmail);
+  }
   if (partial.timezone !== undefined) await setSetting("timezone", partial.timezone);
   if (partial.bufferMinutes !== undefined) {
     await setSetting("bufferMinutes", String(partial.bufferMinutes));

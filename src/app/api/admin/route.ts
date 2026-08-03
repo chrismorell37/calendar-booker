@@ -75,6 +75,13 @@ const settingsSchema = z.object({
     .max(64)
     .regex(/^[a-z0-9-]+$/, "Slug must be lowercase letters, numbers, hyphens"),
   hostName: z.string().min(1).max(120),
+  notifyEmail: z
+    .string()
+    .max(200)
+    .refine(
+      (v) => v.trim() === "" || z.string().email().safeParse(v.trim()).success,
+      "Invalid notification email",
+    ),
   timezone: z.string().min(1),
   bufferMinutes: z.number().int().min(0).max(120),
   slotIntervalMinutes: z.number().int().min(5).max(60),

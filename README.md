@@ -25,8 +25,10 @@ Fill in `.env`:
 
 2. **Google Cloud**
 
-- Create a project and enable the **Google Calendar API**
-- Configure OAuth consent screen
+- Create a project and enable the **Google Calendar API** and **Gmail API**
+  (Gmail is used to email you when someone books)
+- Configure OAuth consent screen (include the Gmail send scope if you add scopes
+  manually: `https://www.googleapis.com/auth/gmail.send`)
 - Create an OAuth **Web** client
 - Add authorized redirect URI matching `GOOGLE_REDIRECT_URI`
 - Add your Google account as a test user if the app is in testing mode
@@ -73,6 +75,10 @@ npm run dev
 
 Availability uses Google Calendar `freebusy` on every conflict calendar (queried per Google account), then filters your weekly windows. Booking creates an event (with Meet link) on the destination calendar and invites the guest.
 
+When a booking succeeds, the app also emails your **Notify email** (default `ctmorell@gmail.com`, configurable in `/admin`, or override with `HOST_NOTIFY_EMAIL`) from the Google account tied to your destination calendar. Guest calendar invites still come from Google Calendar (`sendUpdates`).
+
 Add each Google account you connect as a **test user** on the OAuth consent screen while the app is in testing mode.
 
 After deploying with Turso, reconnect Google once in `/admin` — previous tokens stored in ephemeral `/tmp` SQLite will not migrate.
+
+If you previously connected Google before host email notifications existed, **reconnect Google** in `/admin` once so the new Gmail send permission is granted (and enable the Gmail API in Google Cloud if it isn’t already).
