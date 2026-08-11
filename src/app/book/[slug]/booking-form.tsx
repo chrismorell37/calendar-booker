@@ -38,6 +38,18 @@ function formatDateLabel(ymd: string, timeZone: string) {
   }).format(d);
 }
 
+function guestFacingError(message: string | undefined, fallback: string) {
+  if (!message) return fallback;
+  if (
+    /invalid_grant|invalid_client|oauth|unauthorized|access_denied|expired or was revoked/i.test(
+      message,
+    )
+  ) {
+    return "Scheduling is temporarily unavailable. Please try again soon.";
+  }
+  return message;
+}
+
 export function BookingForm({ slug, hostName, durations, timezone, dates }: Props) {
   const [duration, setDuration] = useState(durations[0] ?? 30);
   const [date, setDate] = useState(dates[0] ?? "");
@@ -64,12 +76,21 @@ export function BookingForm({ slug, hostName, durations, timezone, dates }: Prop
           `/api/availability?slug=${encodeURIComponent(slug)}&date=${encodeURIComponent(date)}&duration=${duration}`,
         );
         const json = (await res.json()) as { slots?: string[]; error?: string };
-        if (!res.ok) throw new Error(json.error ?? "Could not load times");
+        if (!res.ok) {
+          throw new Error(
+            guestFacingError(json.error, "Could not load times"),
+          );
+        }
         if (!cancelled) setSlots(json.slots ?? []);
       } catch (err) {
         if (!cancelled) {
           setSlots([]);
-          setError(err instanceof Error ? err.message : "Could not load times");
+          setError(
+            guestFacingError(
+              err instanceof Error ? err.message : undefined,
+              "Could not load times",
+            ),
+          );
         }
       } finally {
         if (!cancelled) setLoadingSlots(false);
@@ -116,10 +137,17 @@ export function BookingForm({ slug, hostName, durations, timezone, dates }: Prop
         }),
       });
       const json = (await res.json()) as BookResult & { error?: string };
-      if (!res.ok) throw new Error(json.error ?? "Booking failed");
+      if (!res.ok) {
+        throw new Error(guestFacingError(json.error, "Booking failed"));
+      }
       setResult(json);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Booking failed");
+      setError(
+        guestFacingError(
+          err instanceof Error ? err.message : undefined,
+          "Booking failed",
+        ),
+      );
     } finally {
       setSubmitting(false);
     }

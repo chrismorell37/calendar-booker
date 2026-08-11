@@ -24,16 +24,25 @@ const TIMEZONES = [
   "UTC",
 ];
 
+type AccountAuthStatus = {
+  id: number;
+  email: string;
+  ok: boolean;
+  error?: string;
+};
+
 type AdminData = {
   authenticated: boolean;
   googleConnected?: boolean;
   googleEmails?: string[];
   accounts?: ConnectedAccount[];
+  accountAuth?: AccountAuthStatus[];
   settings?: HostSettings;
   calendars?: CalendarPref[];
   bookingUrl?: string;
   /** "turso" on Vercel; "local-file" only for local dev */
   storageBackend?: "turso" | "local-file";
+  refreshAccountErrors?: { id: number; email: string; message: string }[];
 };
 
 export default function AdminPage() {
@@ -71,7 +80,15 @@ export default function AdminPage() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get("connected")) setMessage("Google Calendar connected.");
-    if (params.get("error")) setError(params.get("error"));
+    const oauthError = params.get("error");
+    if (oauthError) {
+      setError(
+        /invalid_grant/i.test(oauthError)
+          ? "Google access expired or was revoked. Disconnect the affected account, then connect it again. If it keeps failing, remove this app under Google Account → Security → Third-party access and retry."
+          : oauthError,
+      );
+      window.history.replaceState({}, "", "/admin");
+    }
     void load();
   }, [load]);
 
@@ -149,12 +166,20 @@ export default function AdminPage() {
           ? {
               ...d,
               accounts: json.accounts ?? d.accounts,
+              accountAuth: json.accountAuth ?? d.accountAuth,
               googleEmails: json.googleEmails ?? d.googleEmails,
               googleConnected: json.googleConnected ?? d.googleConnected,
             }
           : d,
       );
-      setMessage("Calendar list refreshed.");
+      if (json.refreshAccountErrors?.length) {
+        setError(
+          json.refreshAccountErrors.map((e) => e.message).join(" "),
+        );
+        setMessage("Refreshed working accounts; some need reconnecting.");
+      } else {
+        setMessage("Calendar list refreshed.");
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Refresh failed");
     } finally {
@@ -180,6 +205,7 @@ export default function AdminPage() {
           ? {
               ...d,
               accounts: json.accounts ?? [],
+              accountAuth: json.accountAuth ?? [],
               googleEmails: json.googleEmails ?? [],
               googleConnected: json.googleConnected ?? false,
             }
@@ -363,22 +389,51 @@ export default function AdminPage() {
 
         {(data.accounts?.length ?? 0) > 0 && (
           <ul className="mt-4 space-y-2">
-            {(data.accounts ?? []).map((account) => (
-              <li
-                key={account.id}
-                className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-background px-3 py-2 text-sm"
-              >
-                <span>{account.email}</span>
-                <button
-                  type="button"
-                  onClick={() => void removeAccount(account.id)}
-                  className="text-muted underline-offset-2 hover:underline"
+            {(data.accounts ?? []).map((account) => {
+              const auth = data.accountAuth?.find((a) => a.id === account.id);
+              const broken = auth && !auth.ok;
+              return (
+                <li
+                  key={account.id}
+                  className={`rounded-md px-3 py-2 text-sm ${
+                    broken
+                      ? "border border-red-200 bg-red-50"
+                      : "bg-background"
+                  }`}
                 >
-                  Disconnect
-                </button>
-              </li>
-            ))}
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span>
+                      {account.email}
+                      {broken ? (
+                        <span className="ml-2 text-xs font-medium text-red-700">
+                          Needs reconnect
+                        </span>
+                      ) : null}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void removeAccount(account.id)}
+                      className="text-muted underline-offset-2 hover:underline"
+                    >
+                      Disconnect
+                    </button>
+                  </div>
+                  {broken && auth.error ? (
+                    <p className="mt-1 text-xs text-red-800">{auth.error}</p>
+                  ) : null}
+                </li>
+              );
+            })}
           </ul>
+        )}
+
+        {(data.accountAuth ?? []).some((a) => !a.ok) && (
+          <p className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950">
+            One or more Google accounts need reconnecting. Disconnect the
+            broken account, then use &ldquo;Add another Google account&rdquo;.
+            Guests will not see raw Google errors; booking may be limited until
+            this is fixed.
+          </p>
         )}
 
         <div className="mt-4 flex flex-wrap gap-2">

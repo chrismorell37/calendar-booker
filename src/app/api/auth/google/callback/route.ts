@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { adminGoogleErrorMessage } from "@/lib/errors";
 import { exchangeCodeForTokens } from "@/lib/google";
 import { getAdminSession } from "@/lib/session";
 
@@ -14,7 +15,7 @@ export async function GET(request: Request) {
     const error = searchParams.get("error");
     if (error) {
       return NextResponse.redirect(
-        `${appUrl}/admin?error=${encodeURIComponent(error)}`,
+        `${appUrl}/admin?error=${encodeURIComponent(adminGoogleErrorMessage(error))}`,
       );
     }
     if (!code) {
@@ -23,7 +24,10 @@ export async function GET(request: Request) {
     await exchangeCodeForTokens(code);
     return NextResponse.redirect(`${appUrl}/admin?connected=1`);
   } catch (err) {
-    const message = err instanceof Error ? err.message : "OAuth failed";
+    console.error("Google OAuth callback failed", err);
+    const message = adminGoogleErrorMessage(
+      err instanceof Error ? err.message : "OAuth failed",
+    );
     return NextResponse.redirect(
       `${appUrl}/admin?error=${encodeURIComponent(message)}`,
     );

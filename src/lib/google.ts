@@ -12,6 +12,11 @@ import {
   updateCalendarPrefs,
   upsertCalendarsForAccount,
 } from "./db";
+import {
+  GoogleAccountAuthError,
+  isGoogleAuthFailure,
+} from "./errors";
+import type { CalendarPref } from "./types";
 
 // Calendar for availability/booking; Gmail send for host booking alerts.
 const SCOPES = [
@@ -109,9 +114,16 @@ async function getAuthedClient(accountId: number) {
     !stored.expiryDate ||
     stored.expiryDate <= Date.now() + 60_000;
   if (needsRefresh) {
-    const { credentials } = await client.refreshAccessToken();
-    await persistRefreshedTokens(accountId, credentials);
-    client.setCredentials(credentials);
+    try {
+      const { credentials } = await client.refreshAccessToken();
+      await persistRefreshedTokens(accountId, credentials);
+      client.setCredentials(credentials);
+    } catch (err) {
+      if (isGoogleAuthFailure(err)) {
+        throw new GoogleAccountAuthError(accountId, stored.email, err);
+      }
+      throw err;
+    }
   }
 
   client.on("tokens", (tokens) => {
@@ -151,15 +163,85 @@ export async function refreshCalendarListForAccount(accountId: number) {
   return listCalendars();
 }
 
-export async function refreshCalendarList() {
+export type AccountRefreshError = {
+  id: number;
+  email: string;
+  message: string;
+};
+
+export async function refreshCalendarList(): Promise<{
+  calendars: CalendarPref[];
+  accountErrors: AccountRefreshError[];
+}> {
   const accounts = await listConnectedAccounts();
   if (accounts.length === 0) {
     throw new Error("No Google accounts connected");
   }
+  const accountErrors: AccountRefreshError[] = [];
+  let okCount = 0;
   for (const account of accounts) {
-    await refreshCalendarListForAccount(account.id);
+    try {
+      await refreshCalendarListForAccount(account.id);
+      okCount += 1;
+    } catch (err) {
+      console.error(`Calendar refresh failed for ${account.email}`, err);
+      const message =
+        err instanceof GoogleAccountAuthError
+          ? err.message
+          : isGoogleAuthFailure(err)
+            ? `Google access for ${account.email} expired or was revoked. Disconnect and reconnect that account.`
+            : err instanceof Error
+              ? err.message
+              : "Failed to refresh calendars";
+      accountErrors.push({
+        id: account.id,
+        email: account.email,
+        message,
+      });
+    }
   }
-  return listCalendars();
+  if (okCount === 0) {
+    throw new Error(
+      accountErrors.map((e) => e.message).join(" ") ||
+        "All Google accounts need to be reconnected in Admin.",
+    );
+  }
+  return { calendars: await listCalendars(), accountErrors };
+}
+
+export type AccountAuthStatus = {
+  id: number;
+  email: string;
+  ok: boolean;
+  error?: string;
+};
+
+/** Probe each connected account's refresh token (admin-only). */
+export async function getAccountAuthStatuses(): Promise<AccountAuthStatus[]> {
+  const accounts = await listConnectedAccounts();
+  const statuses: AccountAuthStatus[] = [];
+  for (const account of accounts) {
+    try {
+      await getAuthedClient(account.id);
+      statuses.push({ id: account.id, email: account.email, ok: true });
+    } catch (err) {
+      console.error(`Google auth check failed for ${account.email}`, err);
+      statuses.push({
+        id: account.id,
+        email: account.email,
+        ok: false,
+        error:
+          err instanceof GoogleAccountAuthError
+            ? err.message
+            : isGoogleAuthFailure(err)
+              ? `Google access for ${account.email} expired or was revoked. Disconnect and reconnect that account.`
+              : err instanceof Error
+                ? err.message
+                : "Google authentication failed",
+      });
+    }
+  }
+  return statuses;
 }
 
 export type BusyPeriod = { start: Date; end: Date };
@@ -179,25 +261,55 @@ export async function queryFreeBusy(
   }
 
   const busy: BusyPeriod[] = [];
+  let okAccounts = 0;
+  let lastAuthError: unknown = null;
+
   for (const [accountId, calendarIds] of byAccount) {
-    const auth = await getAuthedClient(accountId);
-    const calendar = google.calendar({ version: "v3", auth });
-    const res = await calendar.freebusy.query({
-      requestBody: {
-        timeMin: timeMin.toISOString(),
-        timeMax: timeMax.toISOString(),
-        items: calendarIds.map((id) => ({ id })),
-      },
-    });
-    const calendars = res.data.calendars ?? {};
-    for (const id of calendarIds) {
-      const periods = calendars[id]?.busy ?? [];
-      for (const p of periods) {
-        if (!p.start || !p.end) continue;
-        busy.push({ start: new Date(p.start), end: new Date(p.end) });
+    try {
+      const auth = await getAuthedClient(accountId);
+      const calendar = google.calendar({ version: "v3", auth });
+      const res = await calendar.freebusy.query({
+        requestBody: {
+          timeMin: timeMin.toISOString(),
+          timeMax: timeMax.toISOString(),
+          items: calendarIds.map((id) => ({ id })),
+        },
+      });
+      const calendars = res.data.calendars ?? {};
+      for (const id of calendarIds) {
+        const periods = calendars[id]?.busy ?? [];
+        for (const p of periods) {
+          if (!p.start || !p.end) continue;
+          busy.push({ start: new Date(p.start), end: new Date(p.end) });
+        }
       }
+      okAccounts += 1;
+    } catch (err) {
+      lastAuthError = err;
+      const account = await getAccountById(accountId);
+      console.error(
+        `Skipping freebusy for account ${account?.email ?? accountId}`,
+        err,
+      );
+      if (!isGoogleAuthFailure(err)) {
+        throw err;
+      }
+      // Keep checking other accounts so one revoked token cannot brick booking.
     }
   }
+
+  if (okAccounts === 0) {
+    if (lastAuthError instanceof GoogleAccountAuthError) {
+      throw lastAuthError;
+    }
+    if (isGoogleAuthFailure(lastAuthError)) {
+      throw new GoogleAccountAuthError(0, null, lastAuthError);
+    }
+    throw lastAuthError instanceof Error
+      ? lastAuthError
+      : new Error("Could not check calendar availability");
+  }
+
   return busy;
 }
 
@@ -232,39 +344,56 @@ export async function createCalendarEvent(input: {
     .filter((e) => e && e !== primary);
   const uniqueExtras = [...new Set(extras)];
 
-  const auth = await getAuthedClient(accountId);
+  let auth;
+  try {
+    auth = await getAuthedClient(accountId);
+  } catch (err) {
+    if (isGoogleAuthFailure(err) && !(err instanceof GoogleAccountAuthError)) {
+      const account = await getAccountById(accountId);
+      throw new GoogleAccountAuthError(accountId, account?.email ?? null, err);
+    }
+    throw err;
+  }
   const calendar = google.calendar({ version: "v3", auth });
-  const res = await calendar.events.insert({
-    calendarId: input.calendarId,
-    conferenceDataVersion: 1,
-    sendUpdates: "all",
-    requestBody: {
-      summary: input.summary,
-      description: input.description,
-      start: {
-        dateTime: input.start.toISOString(),
-        timeZone: input.timezone,
-      },
-      end: {
-        dateTime: input.end.toISOString(),
-        timeZone: input.timezone,
-      },
-      attendees: [
-        {
-          email: input.attendeeEmail,
-          displayName: input.attendeeName,
+  try {
+    const res = await calendar.events.insert({
+      calendarId: input.calendarId,
+      conferenceDataVersion: 1,
+      sendUpdates: "all",
+      requestBody: {
+        summary: input.summary,
+        description: input.description,
+        start: {
+          dateTime: input.start.toISOString(),
+          timeZone: input.timezone,
         },
-        ...uniqueExtras.map((email) => ({ email })),
-      ],
-      conferenceData: {
-        createRequest: {
-          requestId: `booking-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-          conferenceSolutionKey: { type: "hangoutsMeet" },
+        end: {
+          dateTime: input.end.toISOString(),
+          timeZone: input.timezone,
+        },
+        attendees: [
+          {
+            email: input.attendeeEmail,
+            displayName: input.attendeeName,
+          },
+          ...uniqueExtras.map((email) => ({ email })),
+        ],
+        conferenceData: {
+          createRequest: {
+            requestId: `booking-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+            conferenceSolutionKey: { type: "hangoutsMeet" },
+          },
         },
       },
-    },
-  });
-  return res.data;
+    });
+    return res.data;
+  } catch (err) {
+    if (isGoogleAuthFailure(err) && !(err instanceof GoogleAccountAuthError)) {
+      const account = await getAccountById(accountId);
+      throw new GoogleAccountAuthError(accountId, account?.email ?? null, err);
+    }
+    throw err;
+  }
 }
 
 export async function isGoogleConnected(): Promise<boolean> {

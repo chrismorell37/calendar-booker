@@ -9,7 +9,9 @@ import {
   updateCalendarPrefs,
   updateHostSettings,
 } from "@/lib/db";
+import { adminGoogleErrorMessage } from "@/lib/errors";
 import {
+  getAccountAuthStatuses,
   getConnectedEmails,
   isGoogleConnected,
   refreshCalendarList,
@@ -43,11 +45,13 @@ function appBaseUrl(request?: Request) {
 
 async function adminPayload(request?: Request) {
   const settings = await getHostSettings();
+  const accountAuth = await getAccountAuthStatuses();
   return {
     authenticated: true,
     googleConnected: await isGoogleConnected(),
     googleEmails: await getConnectedEmails(),
     accounts: await listConnectedAccounts(),
+    accountAuth,
     settings,
     calendars: await listCalendars(),
     storageBackend: getStorageBackend(),
@@ -63,8 +67,12 @@ export async function GET(request: Request) {
     }
     return NextResponse.json(await adminPayload(request));
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Failed to load admin";
-    return NextResponse.json({ error: message }, { status: 500 });
+    console.error("Admin load error", err);
+    const raw = err instanceof Error ? err.message : "Failed to load admin";
+    return NextResponse.json(
+      { error: adminGoogleErrorMessage(raw) },
+      { status: 500 },
+    );
   }
 }
 
@@ -127,8 +135,11 @@ export async function PUT(request: Request) {
       await removeOAuthAccount(body.removeAccountId);
     }
 
+    let refreshAccountErrors: { id: number; email: string; message: string }[] =
+      [];
     if (body.refreshCalendars) {
-      await refreshCalendarList();
+      const refreshed = await refreshCalendarList();
+      refreshAccountErrors = refreshed.accountErrors;
     }
 
     if (body.settings) {
@@ -151,7 +162,13 @@ export async function PUT(request: Request) {
       await updateCalendarPrefs(calendars);
     }
 
-    return NextResponse.json({ ok: true, ...(await adminPayload(request)) });
+    const payload = await adminPayload(request);
+    return NextResponse.json({
+      ok: true,
+      ...payload,
+      refreshAccountErrors:
+        refreshAccountErrors.length > 0 ? refreshAccountErrors : undefined,
+    });
   } catch (err) {
     if (err instanceof z.ZodError) {
       return NextResponse.json(
@@ -159,7 +176,11 @@ export async function PUT(request: Request) {
         { status: 400 },
       );
     }
-    const message = err instanceof Error ? err.message : "Save failed";
-    return NextResponse.json({ error: message }, { status: 500 });
+    console.error("Admin save error", err);
+    const raw = err instanceof Error ? err.message : "Save failed";
+    return NextResponse.json(
+      { error: adminGoogleErrorMessage(raw) },
+      { status: 500 },
+    );
   }
 }

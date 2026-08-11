@@ -6,6 +6,7 @@ import {
   getDestinationCalendar,
   hasAnyGoogleAccount,
 } from "@/lib/db";
+import { publicApiErrorMessage } from "@/lib/errors";
 import {
   createCalendarEvent,
   notifyHostOfBooking,
@@ -38,7 +39,7 @@ export async function POST(request: Request) {
     }
     if (!(await hasAnyGoogleAccount())) {
       return NextResponse.json(
-        { error: "Host has not connected Google Calendar yet" },
+        { error: "Scheduling is temporarily unavailable. Please try again soon." },
         { status: 503 },
       );
     }
@@ -46,7 +47,7 @@ export async function POST(request: Request) {
     const destination = await getDestinationCalendar();
     if (!destination) {
       return NextResponse.json(
-        { error: "Host has not chosen a destination calendar" },
+        { error: "Scheduling is temporarily unavailable. Please try again soon." },
         { status: 503 },
       );
     }
@@ -144,7 +145,10 @@ export async function POST(request: Request) {
         { status: 400 },
       );
     }
-    const message = err instanceof Error ? err.message : "Booking failed";
-    return NextResponse.json({ error: message }, { status: 500 });
+    console.error("Booking error", err);
+    return NextResponse.json(
+      { error: publicApiErrorMessage(err) },
+      { status: 503 },
+    );
   }
 }

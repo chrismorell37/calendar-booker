@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { findHostBySlug, hasAnyGoogleAccount } from "@/lib/db";
+import { publicApiErrorMessage } from "@/lib/errors";
 import { queryFreeBusy } from "@/lib/google";
 import { generateOpenSlots, getDayBounds } from "@/lib/slots";
 
@@ -29,7 +30,7 @@ export async function GET(request: Request) {
     }
     if (!(await hasAnyGoogleAccount())) {
       return NextResponse.json(
-        { error: "Host has not connected Google Calendar yet" },
+        { error: "Scheduling is temporarily unavailable. Please try again soon." },
         { status: 503 },
       );
     }
@@ -50,7 +51,10 @@ export async function GET(request: Request) {
       slots,
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Failed to load availability";
-    return NextResponse.json({ error: message }, { status: 500 });
+    console.error("Availability error", err);
+    return NextResponse.json(
+      { error: publicApiErrorMessage(err) },
+      { status: 503 },
+    );
   }
 }
