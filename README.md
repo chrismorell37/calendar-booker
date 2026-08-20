@@ -16,8 +16,8 @@ Fill in `.env`:
 | Variable | Purpose |
 |----------|---------|
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | From Google Cloud Console |
-| `GOOGLE_REDIRECT_URI` | e.g. `http://localhost:3000/api/auth/google/callback` |
-| `TOKEN_ENCRYPTION_KEY` | 16+ chars; encrypts OAuth tokens |
+| `GOOGLE_REDIRECT_URI` | Local: `http://localhost:3000/api/auth/google/callback` |
+| `TOKEN_ENCRYPTION_KEY` | 32+ chars; encrypts OAuth tokens (keep stable across deploys) |
 | `SESSION_SECRET` | 32+ chars; admin cookie |
 | `ADMIN_PASSWORD` | Password for `/admin` |
 | `NEXT_PUBLIC_APP_URL` | Public base URL |
@@ -25,38 +25,35 @@ Fill in `.env`:
 
 2. **Google Cloud**
 
-- Create a project and enable the **Google Calendar API** and **Gmail API**
-  (Gmail is used to email you when someone books)
-- Configure OAuth consent screen (include the Gmail send scope if you add scopes
-  manually: `https://www.googleapis.com/auth/gmail.send`)
+- Create a project and enable the **Google Calendar API**
+- Configure OAuth consent screen
 - Create an OAuth **Web** client
-- Add authorized redirect URI matching `GOOGLE_REDIRECT_URI`
-- Add your Google account as a test user if the app is in testing mode
+- Add **both** authorized redirect URIs in Google Cloud Console:
+  - `http://localhost:3000/api/auth/google/callback` (local dev)
+  - `https://www.chrismorell.xyz/api/auth/google/callback` (production)
+- **Critical:** set Publishing status to **In production** (not Testing). While the app is in Testing, Google expires refresh tokens after **7 days** and guests will see broken booking until you reconnect.
 
-3. **Database (local vs Vercel)**
+3. **Vercel Production env**
+
+Set these for the **Production** environment (not localhost values from `.env.example`):
+
+| Variable | Value |
+|----------|-------|
+| `NEXT_PUBLIC_APP_URL` | `https://www.chrismorell.xyz` |
+| `GOOGLE_REDIRECT_URI` | `https://www.chrismorell.xyz/api/auth/google/callback` |
+| `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN` | From Turso |
+| `TOKEN_ENCRYPTION_KEY` | Same stable value — never rotate without reconnecting Google |
+
+After changing env vars, **redeploy production**. OAuth redirects derive from the live request host, but these env vars must still be correct for Google Cloud and booking links.
+
+4. **Database (local vs Vercel)**
 
 - **Local:** omit Turso vars; data is stored in `data/booking.db`
-- **Vercel / serverless:** you **must** use [Turso](https://turso.tech) (or any libSQL URL). SQLite on `/tmp` is wiped when instances recycle, which makes Google calendars look disconnected every few minutes.
+- **Vercel / serverless:** you **must** use [Turso](https://turso.tech). SQLite on `/tmp` is wiped when instances recycle.
 
-```bash
-# Example Turso setup
-brew install tursodatabase/tap/turso   # or see turso.tech docs
-turso auth login
-turso db create calendar-booker
-turso db show calendar-booker --url          # → TURSO_DATABASE_URL
-turso db tokens create calendar-booker       # → TURSO_AUTH_TOKEN
-```
+After production is on Turso, open `/admin` — you should see “Persistent storage: Turso”. Then reconnect Google once on the **live site** (not localhost).
 
-Add both values in the Vercel project → **Settings → Environment Variables** for the
-**Production** environment (not only Preview), then **merge this code to `main`** and
-redeploy production. Preview deploys alone will not fix `calendar-booker.vercel.app`.
-
-After production is on Turso, open `/admin` — you should see
-“Persistent storage: Turso”. Then reconnect Google once (old `/tmp` tokens cannot migrate).
-
-Keep `TOKEN_ENCRYPTION_KEY` stable across deploys; changing it makes stored tokens unreadable.
-
-4. **Run**
+5. **Run**
 
 ```bash
 npm run dev
@@ -73,12 +70,19 @@ npm run dev
 4. Set weekly hours, buffer, and durations
 5. Copy your booking link and send it to clients
 
-Availability uses Google Calendar `freebusy` on every conflict calendar (queried per Google account), then filters your weekly windows. Booking creates an event (with Meet link) on the destination calendar and invites the guest.
+Availability uses Google Calendar `freebusy` on every conflict calendar, then filters your weekly windows. If Google is temporarily unavailable, guests still see times from your weekly hours (one dead account cannot brick the page).
 
-When a booking succeeds, the app also emails your **Notify email** (default `ctmorell@gmail.com`, configurable in `/admin`, or override with `HOST_NOTIFY_EMAIL`) from the Google account tied to your destination calendar. Guest calendar invites still come from Google Calendar (`sendUpdates`).
+Booking creates an event (with Meet link) on the destination calendar and invites the guest. Your **Notify email** (default `ctmorell@gmail.com`) is added as a calendar attendee so you receive the invite too.
 
-Add each Google account you connect as a **test user** on the OAuth consent screen while the app is in testing mode.
+If Google is down when someone books, the guest still gets confirmation and the booking is queued in **Pending bookings** in `/admin`. Reconnect Google and click **Send invite**.
 
-After deploying with Turso, reconnect Google once in `/admin` — previous tokens stored in ephemeral `/tmp` SQLite will not migrate.
+## OAuth troubleshooting
 
-If you previously connected Google before host email notifications existed, **reconnect Google** in `/admin` once so the new Gmail send permission is granted (and enable the Gmail API in Google Cloud if it isn’t already).
+| Symptom | Fix |
+|---------|-----|
+| `invalid_grant` every ~7 days | OAuth app still in **Testing** → set to **In production**, reconnect Google |
+| Reconnect redirects to `localhost:3000` | Vercel `NEXT_PUBLIC_APP_URL` / `GOOGLE_REDIRECT_URI` still set to localhost → fix Production env and redeploy |
+| `?error=unauthorized` after Google consent | Admin cookie was on a different host than the callback (e.g. apex vs www) → always use `https://www.chrismorell.xyz/admin` |
+| Calendars “disconnect” after deploy | Turso env missing on Production, or `TOKEN_ENCRYPTION_KEY` changed |
+
+Guests never see raw Google errors (`invalid_grant`, etc.). A broken grant only affects you in `/admin` (account marked **Needs reconnect**).

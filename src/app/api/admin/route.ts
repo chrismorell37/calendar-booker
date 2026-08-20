@@ -1,16 +1,22 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { getAppBaseUrl } from "@/lib/app-url";
 import {
+  getDestinationCalendar,
   getHostSettings,
+  getPendingBookingById,
   getStorageBackend,
   listCalendars,
   listConnectedAccounts,
+  listPendingBookings,
+  markPendingBookingFulfilled,
   removeOAuthAccount,
   updateCalendarPrefs,
   updateHostSettings,
 } from "@/lib/db";
 import { adminGoogleErrorMessage } from "@/lib/errors";
 import {
+  createCalendarEvent,
   getAccountAuthStatuses,
   getConnectedEmails,
   isGoogleConnected,
@@ -27,22 +33,6 @@ async function assertAdmin() {
   return session;
 }
 
-function appBaseUrl(request?: Request) {
-  const fromEnv = process.env.NEXT_PUBLIC_APP_URL?.replace(/\/$/, "");
-  if (fromEnv && !fromEnv.includes("localhost")) return fromEnv;
-
-  if (request) {
-    const host =
-      request.headers.get("x-forwarded-host") ?? request.headers.get("host");
-    const proto =
-      request.headers.get("x-forwarded-proto") ??
-      (host?.includes("localhost") ? "http" : "https");
-    if (host) return `${proto}://${host}`;
-  }
-
-  return fromEnv || "http://localhost:3000";
-}
-
 async function adminPayload(request?: Request) {
   const settings = await getHostSettings();
   const accountAuth = await getAccountAuthStatuses();
@@ -52,10 +42,11 @@ async function adminPayload(request?: Request) {
     googleEmails: await getConnectedEmails(),
     accounts: await listConnectedAccounts(),
     accountAuth,
+    pendingBookings: await listPendingBookings(false),
     settings,
     calendars: await listCalendars(),
     storageBackend: getStorageBackend(),
-    bookingUrl: `${appBaseUrl(request)}/book/${settings.slug}`,
+    bookingUrl: `${getAppBaseUrl(request)}/book/${settings.slug}`,
   };
 }
 
@@ -129,10 +120,44 @@ export async function PUT(request: Request) {
       calendars?: unknown;
       refreshCalendars?: boolean;
       removeAccountId?: number;
+      retryPendingBookingId?: number;
     };
 
     if (typeof body.removeAccountId === "number") {
       await removeOAuthAccount(body.removeAccountId);
+    }
+
+    if (typeof body.retryPendingBookingId === "number") {
+      const pending = await getPendingBookingById(body.retryPendingBookingId);
+      if (!pending || pending.fulfilledAt) {
+        return NextResponse.json(
+          { error: "Pending booking not found or already fulfilled" },
+          { status: 404 },
+        );
+      }
+      const destination = await getDestinationCalendar();
+      if (!destination) {
+        return NextResponse.json(
+          { error: "Choose a destination calendar before retrying" },
+          { status: 400 },
+        );
+      }
+      const settings = await getHostSettings();
+      const notifyEmail =
+        process.env.HOST_NOTIFY_EMAIL?.trim() || settings.notifyEmail.trim();
+      const event = await createCalendarEvent({
+        calendarId: destination.googleCalendarId,
+        summary: pending.summary,
+        description: pending.description ?? undefined,
+        start: new Date(pending.startIso),
+        end: new Date(pending.endIso),
+        timezone: pending.timezone,
+        attendeeEmail: pending.guestEmail,
+        attendeeName: pending.guestName,
+        additionalGuestEmails: pending.guestEmails,
+        hostNotifyEmail: notifyEmail || undefined,
+      });
+      await markPendingBookingFulfilled(pending.id, event.id ?? null);
     }
 
     let refreshAccountErrors: { id: number; email: string; message: string }[] =

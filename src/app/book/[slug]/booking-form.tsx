@@ -12,6 +12,7 @@ type Props = {
 
 type BookResult = {
   ok: true;
+  pending?: boolean;
   htmlLink?: string | null;
   hangoutLink?: string | null;
   start: string;
@@ -77,20 +78,14 @@ export function BookingForm({ slug, hostName, durations, timezone, dates }: Prop
         );
         const json = (await res.json()) as { slots?: string[]; error?: string };
         if (!res.ok) {
-          throw new Error(
-            guestFacingError(json.error, "Could not load times"),
-          );
+          // Never show OAuth/grant errors to guests — treat as no slots.
+          if (!cancelled) setSlots([]);
+          return;
         }
         if (!cancelled) setSlots(json.slots ?? []);
-      } catch (err) {
+      } catch {
         if (!cancelled) {
           setSlots([]);
-          setError(
-            guestFacingError(
-              err instanceof Error ? err.message : undefined,
-              "Could not load times",
-            ),
-          );
         }
       } finally {
         if (!cancelled) setLoadingSlots(false);
@@ -164,7 +159,13 @@ export function BookingForm({ slug, hostName, durations, timezone, dates }: Prop
           {duration}-minute meeting with {result.hostName || hostName}
         </p>
         <p className="mt-5 text-lg font-medium text-ink-soft">{confirmationWhen}</p>
-        <p className="mt-1 text-sm text-muted">A calendar invite was sent to {email}.</p>
+        {result.pending ? (
+          <p className="mt-1 text-sm text-muted">
+            You&apos;re booked. A calendar invite will be sent to {email} shortly.
+          </p>
+        ) : (
+          <p className="mt-1 text-sm text-muted">A calendar invite was sent to {email}.</p>
+        )}
         <div className="mt-7 flex flex-wrap gap-3">
           {result.hangoutLink && (
             <a

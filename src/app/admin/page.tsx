@@ -5,6 +5,7 @@ import type {
   CalendarPref,
   ConnectedAccount,
   HostSettings,
+  PendingBooking,
   TimeWindow,
   WeeklyHours,
 } from "@/lib/types";
@@ -37,6 +38,7 @@ type AdminData = {
   googleEmails?: string[];
   accounts?: ConnectedAccount[];
   accountAuth?: AccountAuthStatus[];
+  pendingBookings?: PendingBooking[];
   settings?: HostSettings;
   calendars?: CalendarPref[];
   bookingUrl?: string;
@@ -67,9 +69,9 @@ export default function AdminPage() {
       }
       const json = (await res.json()) as AdminData & { error?: string };
       if (!res.ok) throw new Error(json.error ?? "Failed to load");
-      setData(json);
       if (json.settings) setSettings(json.settings);
       if (json.calendars) setCalendars(json.calendars);
+      setData(json);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load");
     } finally {
@@ -147,6 +149,40 @@ export default function AdminPage() {
     } finally {
       setSaving(false);
     }
+  }
+
+  async function retryPendingBooking(id: number) {
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/admin", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ retryPendingBookingId: id }),
+      });
+      const json = (await res.json()) as AdminData & { error?: string };
+      if (!res.ok) throw new Error(json.error ?? "Retry failed");
+      if (json.pendingBookings) {
+        setData((d) => (d ? { ...d, pendingBookings: json.pendingBookings } : d));
+      }
+      await load();
+      setMessage("Calendar invite sent for pending booking.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Retry failed");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function formatPendingWhen(booking: PendingBooking) {
+    return new Intl.DateTimeFormat(undefined, {
+      timeZone: booking.timezone,
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    }).format(new Date(booking.startIso));
   }
 
   async function refreshCalendars() {
@@ -366,6 +402,42 @@ export default function AdminPage() {
         </div>
       </section>
 
+      {(data.pendingBookings?.length ?? 0) > 0 && (
+        <section className="mt-6 rounded-lg border border-amber-200 bg-amber-50 p-5">
+          <h2 className="font-medium text-amber-950">Pending bookings</h2>
+          <p className="mt-1 text-sm text-amber-900">
+            These were accepted while Google Calendar was unavailable. Reconnect
+            Google, then send the calendar invite.
+          </p>
+          <ul className="mt-4 space-y-3">
+            {data.pendingBookings!.map((booking) => (
+              <li
+                key={booking.id}
+                className="flex flex-wrap items-center justify-between gap-3 rounded-md bg-white/70 px-3 py-3 text-sm"
+              >
+                <div>
+                  <p className="font-medium">
+                    {booking.guestName} · {formatPendingWhen(booking)}
+                  </p>
+                  <p className="text-xs text-muted">
+                    {booking.guestEmail}
+                    {booking.notes ? ` · ${booking.notes}` : ""}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={() => void retryPendingBooking(booking.id)}
+                  className="rounded-md bg-accent px-3 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-60"
+                >
+                  Send invite
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       <section className="mt-6 rounded-lg border border-border bg-surface p-5">
         <h2 className="font-medium">Google calendars</h2>
         <p className="mt-1 text-sm text-muted">
@@ -520,9 +592,8 @@ export default function AdminPage() {
               placeholder="you@example.com"
             />
             <span className="mt-1 block text-xs text-muted">
-              Sent from your connected Google account via Gmail. Leave blank to
-              disable. Reconnect Google after deploying if you haven&apos;t
-              granted Gmail send permission yet.
+              Added as a calendar invite attendee when someone books. Leave blank
+              to disable.
             </span>
           </label>
           <label className="block text-sm">

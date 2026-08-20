@@ -41,6 +41,24 @@ export type OAuthTokenRow = {
   expiryDate: number | null;
 };
 
+export type PendingBooking = {
+  id: number;
+  slug: string;
+  startIso: string;
+  endIso: string;
+  durationMinutes: number;
+  guestName: string;
+  guestEmail: string;
+  guestEmails: string[];
+  notes: string | null;
+  summary: string;
+  description: string | null;
+  timezone: string;
+  createdAt: string;
+  fulfilledAt: string | null;
+  googleEventId: string | null;
+};
+
 export const DEFAULT_WEEKLY_HOURS: WeeklyHours = {
   "0": null,
   "1": [{ start: "09:00", end: "17:00" }],

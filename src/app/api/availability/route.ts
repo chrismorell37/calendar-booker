@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { findHostBySlug, hasAnyGoogleAccount } from "@/lib/db";
-import { publicApiErrorMessage } from "@/lib/errors";
+import { findHostBySlug } from "@/lib/db";
 import { queryFreeBusy } from "@/lib/google";
 import { generateOpenSlots, getDayBounds } from "@/lib/slots";
 
@@ -28,15 +27,15 @@ export async function GET(request: Request) {
     if (!settings.durations.includes(duration)) {
       return NextResponse.json({ error: "Invalid duration" }, { status: 400 });
     }
-    if (!(await hasAnyGoogleAccount())) {
-      return NextResponse.json(
-        { error: "Scheduling is temporarily unavailable. Please try again soon." },
-        { status: 503 },
-      );
-    }
 
     const bounds = getDayBounds(date, settings.timezone);
-    const busy = await queryFreeBusy(bounds.start, bounds.end);
+    let busy: Awaited<ReturnType<typeof queryFreeBusy>> = [];
+    try {
+      busy = await queryFreeBusy(bounds.start, bounds.end);
+    } catch (err) {
+      console.error("Freebusy failed; showing weekly hours only", err);
+    }
+
     const slots = generateOpenSlots({
       settings,
       dateYmd: date,
@@ -52,9 +51,6 @@ export async function GET(request: Request) {
     });
   } catch (err) {
     console.error("Availability error", err);
-    return NextResponse.json(
-      { error: publicApiErrorMessage(err) },
-      { status: 503 },
-    );
+    return NextResponse.json({ error: "Could not load times" }, { status: 500 });
   }
 }

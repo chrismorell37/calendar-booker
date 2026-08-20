@@ -1,4 +1,5 @@
 import { google } from "googleapis";
+import { getGoogleRedirectUri } from "./app-url";
 import { decrypt, encrypt } from "./crypto";
 import {
   getAccountById,
@@ -18,27 +19,24 @@ import {
 } from "./errors";
 import type { CalendarPref } from "./types";
 
-// Calendar for availability/booking; Gmail send for host booking alerts.
 const SCOPES = [
   "https://www.googleapis.com/auth/calendar",
-  "https://www.googleapis.com/auth/gmail.send",
   "https://www.googleapis.com/auth/userinfo.email",
 ];
 
-function oauthClient() {
+function oauthClient(redirectUri?: string) {
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const redirectUri = process.env.GOOGLE_REDIRECT_URI;
-  if (!clientId || !clientSecret || !redirectUri) {
-    throw new Error(
-      "GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI must be set",
-    );
+  const uri = redirectUri ?? getGoogleRedirectUri();
+  if (!clientId || !clientSecret) {
+    throw new Error("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set");
   }
-  return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+  return new google.auth.OAuth2(clientId, clientSecret, uri);
 }
 
-export function getGoogleAuthUrl(state?: string) {
-  const client = oauthClient();
+export function getGoogleAuthUrl(state?: string, request?: Request) {
+  const redirectUri = getGoogleRedirectUri(request);
+  const client = oauthClient(redirectUri);
   return client.generateAuthUrl({
     access_type: "offline",
     prompt: "consent select_account",
@@ -47,8 +45,9 @@ export function getGoogleAuthUrl(state?: string) {
   });
 }
 
-export async function exchangeCodeForTokens(code: string) {
-  const client = oauthClient();
+export async function exchangeCodeForTokens(code: string, request?: Request) {
+  const redirectUri = getGoogleRedirectUri(request);
+  const client = oauthClient(redirectUri);
   const { tokens } = await client.getToken(code);
   if (!tokens.refresh_token) {
     throw new Error(
@@ -107,8 +106,6 @@ async function getAuthedClient(accountId: number) {
     expiry_date: stored.expiryDate ?? undefined,
   });
 
-  // On serverless, await token persistence — fire-and-forget can be dropped
-  // when the isolate freezes after the response is sent.
   const needsRefresh =
     !stored.accessTokenEncrypted ||
     !stored.expiryDate ||
@@ -246,6 +243,7 @@ export async function getAccountAuthStatuses(): Promise<AccountAuthStatus[]> {
 
 export type BusyPeriod = { start: Date; end: Date };
 
+/** Returns busy periods; skips dead accounts; returns [] if none work (fail-open). */
 export async function queryFreeBusy(
   timeMin: Date,
   timeMax: Date,
@@ -261,8 +259,6 @@ export async function queryFreeBusy(
   }
 
   const busy: BusyPeriod[] = [];
-  let okAccounts = 0;
-  let lastAuthError: unknown = null;
 
   for (const [accountId, calendarIds] of byAccount) {
     try {
@@ -283,31 +279,16 @@ export async function queryFreeBusy(
           busy.push({ start: new Date(p.start), end: new Date(p.end) });
         }
       }
-      okAccounts += 1;
     } catch (err) {
-      lastAuthError = err;
       const account = await getAccountById(accountId);
       console.error(
         `Skipping freebusy for account ${account?.email ?? accountId}`,
         err,
       );
       if (!isGoogleAuthFailure(err)) {
-        throw err;
+        console.error("Non-auth freebusy error; continuing without this calendar", err);
       }
-      // Keep checking other accounts so one revoked token cannot brick booking.
     }
-  }
-
-  if (okAccounts === 0) {
-    if (lastAuthError instanceof GoogleAccountAuthError) {
-      throw lastAuthError;
-    }
-    if (isGoogleAuthFailure(lastAuthError)) {
-      throw new GoogleAccountAuthError(0, null, lastAuthError);
-    }
-    throw lastAuthError instanceof Error
-      ? lastAuthError
-      : new Error("Could not check calendar availability");
   }
 
   return busy;
@@ -323,6 +304,7 @@ export async function createCalendarEvent(input: {
   attendeeEmail: string;
   attendeeName: string;
   additionalGuestEmails?: string[];
+  hostNotifyEmail?: string;
 }) {
   const destination = await getDestinationCalendar();
   if (!destination || destination.googleCalendarId !== input.calendarId) {
@@ -343,6 +325,16 @@ export async function createCalendarEvent(input: {
     .map((e) => e.trim().toLowerCase())
     .filter((e) => e && e !== primary);
   const uniqueExtras = [...new Set(extras)];
+
+  const hostNotify = input.hostNotifyEmail?.trim().toLowerCase();
+  const attendeeEmails = new Set([primary, ...uniqueExtras]);
+  const attendees: Array<{ email: string; displayName?: string }> = [
+    { email: input.attendeeEmail, displayName: input.attendeeName },
+    ...uniqueExtras.map((email) => ({ email })),
+  ];
+  if (hostNotify && !attendeeEmails.has(hostNotify)) {
+    attendees.push({ email: hostNotify });
+  }
 
   let auth;
   try {
@@ -371,13 +363,7 @@ export async function createCalendarEvent(input: {
           dateTime: input.end.toISOString(),
           timeZone: input.timezone,
         },
-        attendees: [
-          {
-            email: input.attendeeEmail,
-            displayName: input.attendeeName,
-          },
-          ...uniqueExtras.map((email) => ({ email })),
-        ],
+        attendees,
         conferenceData: {
           createRequest: {
             requestId: `booking-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
@@ -402,109 +388,4 @@ export async function isGoogleConnected(): Promise<boolean> {
 
 export async function getConnectedEmails(): Promise<string[]> {
   return (await listConnectedAccounts()).map((a) => a.email);
-}
-
-function encodeRfc2047Subject(subject: string): string {
-  if (/^[\x20-\x7E]*$/.test(subject)) return subject;
-  return `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`;
-}
-
-function toBase64Url(raw: string): string {
-  return Buffer.from(raw, "utf8")
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
-/** Send a plain-text email from a connected Google account via Gmail API. */
-export async function sendGmailMessage(input: {
-  accountId: number;
-  to: string;
-  subject: string;
-  body: string;
-}) {
-  const auth = await getAuthedClient(input.accountId);
-  const gmail = google.gmail({ version: "v1", auth });
-  const fromAccount = await getAccountById(input.accountId);
-  const bodyBase64 = Buffer.from(input.body, "utf8").toString("base64");
-  const headers = [
-    ...(fromAccount?.email ? [`From: ${fromAccount.email}`] : []),
-    `To: ${input.to}`,
-    `Subject: ${encodeRfc2047Subject(input.subject)}`,
-    "MIME-Version: 1.0",
-    'Content-Type: text/plain; charset="UTF-8"',
-    "Content-Transfer-Encoding: base64",
-  ];
-  const mime = [...headers, "", bodyBase64].join("\r\n");
-
-  await gmail.users.messages.send({
-    userId: "me",
-    requestBody: { raw: toBase64Url(mime) },
-  });
-}
-
-export async function notifyHostOfBooking(input: {
-  to: string;
-  guestName: string;
-  guestEmail: string;
-  guestEmails?: string[];
-  notes?: string;
-  summary: string;
-  start: Date;
-  end: Date;
-  timezone: string;
-  hangoutLink?: string | null;
-  htmlLink?: string | null;
-}) {
-  const to = input.to.trim();
-  if (!to) return;
-
-  const destination = await getDestinationCalendar();
-  if (!destination) {
-    throw new Error("No destination calendar for host notification email");
-  }
-
-  const when = new Intl.DateTimeFormat("en-US", {
-    timeZone: input.timezone,
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    timeZoneName: "short",
-  }).format(input.start);
-
-  const durationMins = Math.round(
-    (input.end.getTime() - input.start.getTime()) / 60_000,
-  );
-
-  const lines = [
-    "A new meeting was booked on your booking page.",
-    "",
-    `Title: ${input.summary}`,
-    `When: ${when}`,
-    `Duration: ${durationMins} minutes`,
-    `Guest: ${input.guestName} <${input.guestEmail}>`,
-  ];
-  if (input.guestEmails?.length) {
-    lines.push(`Additional guests: ${input.guestEmails.join(", ")}`);
-  }
-  if (input.notes?.trim()) {
-    lines.push(`Notes: ${input.notes.trim()}`);
-  }
-  if (input.hangoutLink) {
-    lines.push(`Meet: ${input.hangoutLink}`);
-  }
-  if (input.htmlLink) {
-    lines.push(`Calendar: ${input.htmlLink}`);
-  }
-
-  await sendGmailMessage({
-    accountId: destination.accountId,
-    to,
-    subject: `New booking: ${input.summary}`,
-    body: lines.join("\n"),
-  });
 }
