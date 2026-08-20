@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { findHostBySlug, hasAnyGoogleAccount } from "@/lib/db";
+import { findHostBySlug } from "@/lib/db";
 import { queryFreeBusy } from "@/lib/google";
 import { generateOpenSlots, getDayBounds } from "@/lib/slots";
 
@@ -27,15 +27,15 @@ export async function GET(request: Request) {
     if (!settings.durations.includes(duration)) {
       return NextResponse.json({ error: "Invalid duration" }, { status: 400 });
     }
-    if (!(await hasAnyGoogleAccount())) {
-      return NextResponse.json(
-        { error: "Host has not connected Google Calendar yet" },
-        { status: 503 },
-      );
-    }
 
     const bounds = getDayBounds(date, settings.timezone);
-    const busy = await queryFreeBusy(bounds.start, bounds.end);
+    let busy: Awaited<ReturnType<typeof queryFreeBusy>> = [];
+    try {
+      busy = await queryFreeBusy(bounds.start, bounds.end);
+    } catch (err) {
+      console.error("Freebusy failed; showing weekly hours only", err);
+    }
+
     const slots = generateOpenSlots({
       settings,
       dateYmd: date,
@@ -50,7 +50,7 @@ export async function GET(request: Request) {
       slots,
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Failed to load availability";
-    return NextResponse.json({ error: message }, { status: 500 });
+    console.error("Availability error", err);
+    return NextResponse.json({ error: "Could not load times" }, { status: 500 });
   }
 }

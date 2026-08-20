@@ -7,6 +7,7 @@ import {
   type ConnectedAccount,
   type HostSettings,
   type OAuthTokenRow,
+  type PendingBooking,
   type WeeklyHours,
 } from "./types";
 
@@ -129,6 +130,10 @@ async function seedDefaults(client: Client) {
       },
       {
         sql: "INSERT INTO settings (key, value) VALUES (?, ?)",
+        args: ["notifyEmail", DEFAULT_SETTINGS.notifyEmail],
+      },
+      {
+        sql: "INSERT INTO settings (key, value) VALUES (?, ?)",
         args: ["timezone", DEFAULT_SETTINGS.timezone],
       },
       {
@@ -187,6 +192,24 @@ async function ensureDb(): Promise<Client> {
           updated_at TEXT NOT NULL,
           FOREIGN KEY (account_id) REFERENCES oauth_accounts(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS pending_bookings (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          slug TEXT NOT NULL,
+          start_iso TEXT NOT NULL,
+          end_iso TEXT NOT NULL,
+          duration_minutes INTEGER NOT NULL,
+          guest_name TEXT NOT NULL,
+          guest_email TEXT NOT NULL,
+          guest_emails_json TEXT,
+          notes TEXT,
+          summary TEXT NOT NULL,
+          description TEXT,
+          timezone TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          fulfilled_at TEXT,
+          google_event_id TEXT
+        );
       `);
       await migrateLegacy(client);
       await seedDefaults(client);
@@ -235,6 +258,8 @@ export async function getHostSettings(): Promise<HostSettings> {
   return {
     slug: (await getSetting("slug")) ?? DEFAULT_SETTINGS.slug,
     hostName: (await getSetting("hostName")) ?? DEFAULT_SETTINGS.hostName,
+    notifyEmail:
+      (await getSetting("notifyEmail")) ?? DEFAULT_SETTINGS.notifyEmail,
     timezone: (await getSetting("timezone")) ?? DEFAULT_SETTINGS.timezone,
     bufferMinutes: Number(
       (await getSetting("bufferMinutes")) ?? DEFAULT_SETTINGS.bufferMinutes,
@@ -255,6 +280,9 @@ export async function getHostSettings(): Promise<HostSettings> {
 export async function updateHostSettings(partial: Partial<HostSettings>) {
   if (partial.slug !== undefined) await setSetting("slug", partial.slug);
   if (partial.hostName !== undefined) await setSetting("hostName", partial.hostName);
+  if (partial.notifyEmail !== undefined) {
+    await setSetting("notifyEmail", partial.notifyEmail);
+  }
   if (partial.timezone !== undefined) await setSetting("timezone", partial.timezone);
   if (partial.bufferMinutes !== undefined) {
     await setSetting("bufferMinutes", String(partial.bufferMinutes));
@@ -548,4 +576,110 @@ export async function findHostBySlug(slug: string): Promise<HostSettings | null>
 export async function hasAnyGoogleAccount(): Promise<boolean> {
   const res = await execute("SELECT COUNT(*) AS c FROM oauth_accounts");
   return Number(res.rows[0]?.c ?? 0) > 0;
+}
+
+function rowToPendingBooking(row: Record<string, unknown>): PendingBooking {
+  const guestEmailsRaw = row.guestEmailsJson ?? row.guest_emails_json;
+  let guestEmails: string[] = [];
+  if (typeof guestEmailsRaw === "string" && guestEmailsRaw) {
+    try {
+      guestEmails = JSON.parse(guestEmailsRaw) as string[];
+    } catch {
+      guestEmails = [];
+    }
+  }
+  return {
+    id: Number(row.id),
+    slug: String(row.slug),
+    startIso: String(row.startIso ?? row.start_iso),
+    endIso: String(row.endIso ?? row.end_iso),
+    durationMinutes: Number(row.durationMinutes ?? row.duration_minutes),
+    guestName: String(row.guestName ?? row.guest_name),
+    guestEmail: String(row.guestEmail ?? row.guest_email),
+    guestEmails,
+    notes: row.notes == null ? null : String(row.notes),
+    summary: String(row.summary),
+    description: row.description == null ? null : String(row.description),
+    timezone: String(row.timezone),
+    createdAt: String(row.createdAt ?? row.created_at),
+    fulfilledAt:
+      row.fulfilledAt == null && row.fulfilled_at == null
+        ? null
+        : String(row.fulfilledAt ?? row.fulfilled_at),
+    googleEventId:
+      row.googleEventId == null && row.google_event_id == null
+        ? null
+        : String(row.googleEventId ?? row.google_event_id),
+  };
+}
+
+export async function insertPendingBooking(input: {
+  slug: string;
+  startIso: string;
+  endIso: string;
+  durationMinutes: number;
+  guestName: string;
+  guestEmail: string;
+  guestEmails?: string[];
+  notes?: string;
+  summary: string;
+  description?: string;
+  timezone: string;
+}): Promise<PendingBooking> {
+  const createdAt = new Date().toISOString();
+  const info = await execute(
+    `INSERT INTO pending_bookings (
+       slug, start_iso, end_iso, duration_minutes,
+       guest_name, guest_email, guest_emails_json, notes,
+       summary, description, timezone, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      input.slug,
+      input.startIso,
+      input.endIso,
+      input.durationMinutes,
+      input.guestName,
+      input.guestEmail,
+      input.guestEmails?.length ? JSON.stringify(input.guestEmails) : null,
+      input.notes ?? null,
+      input.summary,
+      input.description ?? null,
+      input.timezone,
+      createdAt,
+    ],
+  );
+  const id = Number(info.lastInsertRowid);
+  const row = await execute("SELECT * FROM pending_bookings WHERE id = ?", [id]);
+  return rowToPendingBooking(row.rows[0] as Record<string, unknown>);
+}
+
+export async function listPendingBookings(
+  includeFulfilled = false,
+): Promise<PendingBooking[]> {
+  const sql = includeFulfilled
+    ? `SELECT * FROM pending_bookings ORDER BY created_at DESC`
+    : `SELECT * FROM pending_bookings WHERE fulfilled_at IS NULL ORDER BY created_at ASC`;
+  const res = await execute(sql);
+  return res.rows.map((r) => rowToPendingBooking(r as Record<string, unknown>));
+}
+
+export async function getPendingBookingById(
+  id: number,
+): Promise<PendingBooking | null> {
+  const res = await execute("SELECT * FROM pending_bookings WHERE id = ?", [id]);
+  const row = res.rows[0];
+  if (!row) return null;
+  return rowToPendingBooking(row as Record<string, unknown>);
+}
+
+export async function markPendingBookingFulfilled(
+  id: number,
+  googleEventId: string | null,
+) {
+  await execute(
+    `UPDATE pending_bookings
+     SET fulfilled_at = ?, google_event_id = ?
+     WHERE id = ?`,
+    [new Date().toISOString(), googleEventId, id],
+  );
 }

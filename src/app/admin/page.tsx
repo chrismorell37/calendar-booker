@@ -5,6 +5,7 @@ import type {
   CalendarPref,
   ConnectedAccount,
   HostSettings,
+  PendingBooking,
   TimeWindow,
   WeeklyHours,
 } from "@/lib/types";
@@ -24,16 +25,26 @@ const TIMEZONES = [
   "UTC",
 ];
 
+type AccountAuthStatus = {
+  id: number;
+  email: string;
+  ok: boolean;
+  error?: string;
+};
+
 type AdminData = {
   authenticated: boolean;
   googleConnected?: boolean;
   googleEmails?: string[];
   accounts?: ConnectedAccount[];
+  accountAuth?: AccountAuthStatus[];
+  pendingBookings?: PendingBooking[];
   settings?: HostSettings;
   calendars?: CalendarPref[];
   bookingUrl?: string;
   /** "turso" on Vercel; "local-file" only for local dev */
   storageBackend?: "turso" | "local-file";
+  refreshAccountErrors?: { id: number; email: string; message: string }[];
 };
 
 export default function AdminPage() {
@@ -58,9 +69,9 @@ export default function AdminPage() {
       }
       const json = (await res.json()) as AdminData & { error?: string };
       if (!res.ok) throw new Error(json.error ?? "Failed to load");
-      setData(json);
       if (json.settings) setSettings(json.settings);
       if (json.calendars) setCalendars(json.calendars);
+      setData(json);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load");
     } finally {
@@ -71,7 +82,15 @@ export default function AdminPage() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get("connected")) setMessage("Google Calendar connected.");
-    if (params.get("error")) setError(params.get("error"));
+    const oauthError = params.get("error");
+    if (oauthError) {
+      setError(
+        /invalid_grant/i.test(oauthError)
+          ? "Google access expired or was revoked. Disconnect the affected account, then connect it again. If it keeps failing, remove this app under Google Account → Security → Third-party access and retry."
+          : oauthError,
+      );
+      window.history.replaceState({}, "", "/admin");
+    }
     void load();
   }, [load]);
 
@@ -132,6 +151,40 @@ export default function AdminPage() {
     }
   }
 
+  async function retryPendingBooking(id: number) {
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/admin", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ retryPendingBookingId: id }),
+      });
+      const json = (await res.json()) as AdminData & { error?: string };
+      if (!res.ok) throw new Error(json.error ?? "Retry failed");
+      if (json.pendingBookings) {
+        setData((d) => (d ? { ...d, pendingBookings: json.pendingBookings } : d));
+      }
+      await load();
+      setMessage("Calendar invite sent for pending booking.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Retry failed");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function formatPendingWhen(booking: PendingBooking) {
+    return new Intl.DateTimeFormat(undefined, {
+      timeZone: booking.timezone,
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    }).format(new Date(booking.startIso));
+  }
+
   async function refreshCalendars() {
     setSaving(true);
     setError(null);
@@ -149,12 +202,20 @@ export default function AdminPage() {
           ? {
               ...d,
               accounts: json.accounts ?? d.accounts,
+              accountAuth: json.accountAuth ?? d.accountAuth,
               googleEmails: json.googleEmails ?? d.googleEmails,
               googleConnected: json.googleConnected ?? d.googleConnected,
             }
           : d,
       );
-      setMessage("Calendar list refreshed.");
+      if (json.refreshAccountErrors?.length) {
+        setError(
+          json.refreshAccountErrors.map((e) => e.message).join(" "),
+        );
+        setMessage("Refreshed working accounts; some need reconnecting.");
+      } else {
+        setMessage("Calendar list refreshed.");
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Refresh failed");
     } finally {
@@ -180,6 +241,7 @@ export default function AdminPage() {
           ? {
               ...d,
               accounts: json.accounts ?? [],
+              accountAuth: json.accountAuth ?? [],
               googleEmails: json.googleEmails ?? [],
               googleConnected: json.googleConnected ?? false,
             }
@@ -340,6 +402,42 @@ export default function AdminPage() {
         </div>
       </section>
 
+      {(data.pendingBookings?.length ?? 0) > 0 && (
+        <section className="mt-6 rounded-lg border border-amber-200 bg-amber-50 p-5">
+          <h2 className="font-medium text-amber-950">Pending bookings</h2>
+          <p className="mt-1 text-sm text-amber-900">
+            These were accepted while Google Calendar was unavailable. Reconnect
+            Google, then send the calendar invite.
+          </p>
+          <ul className="mt-4 space-y-3">
+            {data.pendingBookings!.map((booking) => (
+              <li
+                key={booking.id}
+                className="flex flex-wrap items-center justify-between gap-3 rounded-md bg-white/70 px-3 py-3 text-sm"
+              >
+                <div>
+                  <p className="font-medium">
+                    {booking.guestName} · {formatPendingWhen(booking)}
+                  </p>
+                  <p className="text-xs text-muted">
+                    {booking.guestEmail}
+                    {booking.notes ? ` · ${booking.notes}` : ""}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={() => void retryPendingBooking(booking.id)}
+                  className="rounded-md bg-accent px-3 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-60"
+                >
+                  Send invite
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       <section className="mt-6 rounded-lg border border-border bg-surface p-5">
         <h2 className="font-medium">Google calendars</h2>
         <p className="mt-1 text-sm text-muted">
@@ -363,22 +461,51 @@ export default function AdminPage() {
 
         {(data.accounts?.length ?? 0) > 0 && (
           <ul className="mt-4 space-y-2">
-            {(data.accounts ?? []).map((account) => (
-              <li
-                key={account.id}
-                className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-background px-3 py-2 text-sm"
-              >
-                <span>{account.email}</span>
-                <button
-                  type="button"
-                  onClick={() => void removeAccount(account.id)}
-                  className="text-muted underline-offset-2 hover:underline"
+            {(data.accounts ?? []).map((account) => {
+              const auth = data.accountAuth?.find((a) => a.id === account.id);
+              const broken = auth && !auth.ok;
+              return (
+                <li
+                  key={account.id}
+                  className={`rounded-md px-3 py-2 text-sm ${
+                    broken
+                      ? "border border-red-200 bg-red-50"
+                      : "bg-background"
+                  }`}
                 >
-                  Disconnect
-                </button>
-              </li>
-            ))}
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span>
+                      {account.email}
+                      {broken ? (
+                        <span className="ml-2 text-xs font-medium text-red-700">
+                          Needs reconnect
+                        </span>
+                      ) : null}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void removeAccount(account.id)}
+                      className="text-muted underline-offset-2 hover:underline"
+                    >
+                      Disconnect
+                    </button>
+                  </div>
+                  {broken && auth.error ? (
+                    <p className="mt-1 text-xs text-red-800">{auth.error}</p>
+                  ) : null}
+                </li>
+              );
+            })}
           </ul>
+        )}
+
+        {(data.accountAuth ?? []).some((a) => !a.ok) && (
+          <p className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950">
+            One or more Google accounts need reconnecting. Disconnect the
+            broken account, then use &ldquo;Add another Google account&rdquo;.
+            Guests will not see raw Google errors; booking may be limited until
+            this is fixed.
+          </p>
         )}
 
         <div className="mt-4 flex flex-wrap gap-2">
@@ -452,6 +579,22 @@ export default function AdminPage() {
               value={settings.hostName}
               onChange={(e) => setSettings({ ...settings, hostName: e.target.value })}
             />
+          </label>
+          <label className="block text-sm sm:col-span-2">
+            <span className="text-muted">Notify email on new bookings</span>
+            <input
+              type="email"
+              className="mt-1 w-full rounded-md border border-border px-3 py-2"
+              value={settings.notifyEmail}
+              onChange={(e) =>
+                setSettings({ ...settings, notifyEmail: e.target.value })
+              }
+              placeholder="you@example.com"
+            />
+            <span className="mt-1 block text-xs text-muted">
+              Added as a calendar invite attendee when someone books. Leave blank
+              to disable.
+            </span>
           </label>
           <label className="block text-sm">
             <span className="text-muted">URL slug</span>

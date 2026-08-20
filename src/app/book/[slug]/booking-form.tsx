@@ -12,6 +12,7 @@ type Props = {
 
 type BookResult = {
   ok: true;
+  pending?: boolean;
   htmlLink?: string | null;
   hangoutLink?: string | null;
   start: string;
@@ -36,6 +37,18 @@ function formatDateLabel(ymd: string, timeZone: string) {
     month: "short",
     day: "numeric",
   }).format(d);
+}
+
+function guestFacingError(message: string | undefined, fallback: string) {
+  if (!message) return fallback;
+  if (
+    /invalid_grant|invalid_client|oauth|unauthorized|access_denied|expired or was revoked/i.test(
+      message,
+    )
+  ) {
+    return "Scheduling is temporarily unavailable. Please try again soon.";
+  }
+  return message;
 }
 
 export function BookingForm({ slug, hostName, durations, timezone, dates }: Props) {
@@ -64,12 +77,15 @@ export function BookingForm({ slug, hostName, durations, timezone, dates }: Prop
           `/api/availability?slug=${encodeURIComponent(slug)}&date=${encodeURIComponent(date)}&duration=${duration}`,
         );
         const json = (await res.json()) as { slots?: string[]; error?: string };
-        if (!res.ok) throw new Error(json.error ?? "Could not load times");
+        if (!res.ok) {
+          // Never show OAuth/grant errors to guests — treat as no slots.
+          if (!cancelled) setSlots([]);
+          return;
+        }
         if (!cancelled) setSlots(json.slots ?? []);
-      } catch (err) {
+      } catch {
         if (!cancelled) {
           setSlots([]);
-          setError(err instanceof Error ? err.message : "Could not load times");
         }
       } finally {
         if (!cancelled) setLoadingSlots(false);
@@ -116,10 +132,17 @@ export function BookingForm({ slug, hostName, durations, timezone, dates }: Prop
         }),
       });
       const json = (await res.json()) as BookResult & { error?: string };
-      if (!res.ok) throw new Error(json.error ?? "Booking failed");
+      if (!res.ok) {
+        throw new Error(guestFacingError(json.error, "Booking failed"));
+      }
       setResult(json);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Booking failed");
+      setError(
+        guestFacingError(
+          err instanceof Error ? err.message : undefined,
+          "Booking failed",
+        ),
+      );
     } finally {
       setSubmitting(false);
     }
@@ -136,7 +159,13 @@ export function BookingForm({ slug, hostName, durations, timezone, dates }: Prop
           {duration}-minute meeting with {result.hostName || hostName}
         </p>
         <p className="mt-5 text-lg font-medium text-ink-soft">{confirmationWhen}</p>
-        <p className="mt-1 text-sm text-muted">A calendar invite was sent to {email}.</p>
+        {result.pending ? (
+          <p className="mt-1 text-sm text-muted">
+            You&apos;re booked. A calendar invite will be sent to {email} shortly.
+          </p>
+        ) : (
+          <p className="mt-1 text-sm text-muted">A calendar invite was sent to {email}.</p>
+        )}
         <div className="mt-7 flex flex-wrap gap-3">
           {result.hangoutLink && (
             <a

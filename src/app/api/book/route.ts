@@ -4,8 +4,9 @@ import { z } from "zod";
 import {
   findHostBySlug,
   getDestinationCalendar,
-  hasAnyGoogleAccount,
+  insertPendingBooking,
 } from "@/lib/db";
+import { GoogleAccountAuthError, isGoogleAuthFailure } from "@/lib/errors";
 import { createCalendarEvent, queryFreeBusy } from "@/lib/google";
 import { generateOpenSlots, getDayBounds } from "@/lib/slots";
 
@@ -19,6 +20,28 @@ const bookSchema = z.object({
   notes: z.string().max(2000).optional(),
 });
 
+function bookingSuccessResponse(input: {
+  settings: { hostName: string; timezone: string };
+  start: Date;
+  end: Date;
+  pending?: boolean;
+  htmlLink?: string | null;
+  hangoutLink?: string | null;
+  eventId?: string | null;
+}) {
+  return NextResponse.json({
+    ok: true as const,
+    pending: input.pending ?? false,
+    eventId: input.eventId ?? null,
+    htmlLink: input.htmlLink ?? null,
+    hangoutLink: input.hangoutLink ?? null,
+    start: input.start.toISOString(),
+    end: input.end.toISOString(),
+    timezone: input.settings.timezone,
+    hostName: input.settings.hostName,
+  });
+}
+
 export async function POST(request: Request) {
   try {
     const body = bookSchema.parse(await request.json());
@@ -31,20 +54,6 @@ export async function POST(request: Request) {
     }
     if (!settings.durations.includes(body.duration)) {
       return NextResponse.json({ error: "Invalid duration" }, { status: 400 });
-    }
-    if (!(await hasAnyGoogleAccount())) {
-      return NextResponse.json(
-        { error: "Host has not connected Google Calendar yet" },
-        { status: 503 },
-      );
-    }
-
-    const destination = await getDestinationCalendar();
-    if (!destination) {
-      return NextResponse.json(
-        { error: "Host has not chosen a destination calendar" },
-        { status: 503 },
-      );
     }
 
     const start = new Date(body.start);
@@ -83,31 +92,77 @@ export async function POST(request: Request) {
       .filter(Boolean)
       .join("\n");
 
-    const event = await createCalendarEvent({
-      calendarId: destination.googleCalendarId,
-      summary,
-      description,
-      start,
-      end,
-      timezone: settings.timezone,
-      attendeeEmail: body.email,
-      attendeeName: body.name,
-      additionalGuestEmails: guestEmails,
-    });
+    const notifyEmail =
+      process.env.HOST_NOTIFY_EMAIL?.trim() || settings.notifyEmail.trim();
 
-    return NextResponse.json({
-      ok: true,
-      eventId: event.id,
-      htmlLink: event.htmlLink,
-      hangoutLink:
+    const destination = await getDestinationCalendar();
+    if (!destination) {
+      await insertPendingBooking({
+        slug: body.slug,
+        startIso: start.toISOString(),
+        endIso: end.toISOString(),
+        durationMinutes: body.duration,
+        guestName: body.name,
+        guestEmail: body.email,
+        guestEmails,
+        notes: body.notes,
+        summary,
+        description,
+        timezone: settings.timezone,
+      });
+      return bookingSuccessResponse({ settings, start, end, pending: true });
+    }
+
+    try {
+      const event = await createCalendarEvent({
+        calendarId: destination.googleCalendarId,
+        summary,
+        description,
+        start,
+        end,
+        timezone: settings.timezone,
+        attendeeEmail: body.email,
+        attendeeName: body.name,
+        additionalGuestEmails: guestEmails,
+        hostNotifyEmail: notifyEmail || undefined,
+      });
+
+      const hangoutLink =
         event.hangoutLink ??
         event.conferenceData?.entryPoints?.find((e) => e.entryPointType === "video")
-          ?.uri,
-      start: start.toISOString(),
-      end: end.toISOString(),
-      timezone: settings.timezone,
-      hostName: settings.hostName,
-    });
+          ?.uri;
+
+      return bookingSuccessResponse({
+        settings,
+        start,
+        end,
+        eventId: event.id ?? null,
+        htmlLink: event.htmlLink,
+        hangoutLink,
+      });
+    } catch (err) {
+      if (
+        err instanceof GoogleAccountAuthError ||
+        isGoogleAuthFailure(err)
+      ) {
+        console.error("Google unavailable; queueing pending booking", err);
+        await insertPendingBooking({
+          slug: body.slug,
+          startIso: start.toISOString(),
+          endIso: end.toISOString(),
+          durationMinutes: body.duration,
+          guestName: body.name,
+          guestEmail: body.email,
+          guestEmails,
+          notes: body.notes,
+          summary,
+          description,
+          timezone: settings.timezone,
+        });
+        return bookingSuccessResponse({ settings, start, end, pending: true });
+      }
+      throw err;
+    }
   } catch (err) {
     if (err instanceof z.ZodError) {
       return NextResponse.json(
@@ -115,7 +170,7 @@ export async function POST(request: Request) {
         { status: 400 },
       );
     }
-    const message = err instanceof Error ? err.message : "Booking failed";
-    return NextResponse.json({ error: message }, { status: 500 });
+    console.error("Booking error", err);
+    return NextResponse.json({ error: "Booking failed. Please try again." }, { status: 500 });
   }
 }
